@@ -15,6 +15,8 @@ use cryptool_lib::{
 use eframe::egui;
 use zeroize::Zeroize;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RibbonTab {
     Start,
@@ -1066,7 +1068,7 @@ impl eframe::App for CryptoolApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ui.ctx(), |ui| {
                     ui.set_max_width(340.0);
-                    ui.label(egui::RichText::new("cryptool 0.2.0").strong());
+                    ui.label(egui::RichText::new(format!("cryptool {VERSION}")).strong());
                     ui.label("Lokale Ver- und Entschlüsselung von Dateien und Text.");
                     ui.add_space(8.0);
                     ui.label("CTX · Argon2id · XChaCha20-Poly1305");
@@ -1578,7 +1580,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "cryptool",
+        &format!("cryptool {VERSION}"),
         options,
         Box::new(|_creation_context| Ok(Box::<CryptoolApp>::default())),
     )

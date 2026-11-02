@@ -1,7 +1,8 @@
 [package]
 name = "cryptool-core"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 argon2 = "0.5"

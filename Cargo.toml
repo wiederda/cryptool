@@ -2,6 +2,13 @@
 resolver = "2"
 members = ["crates/core", "crates/lib", "crates/cli", "crates/gui"]
 
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+# license = "..."      # hier deine Lizenz eintragen
+# repository = "https://github.com/<du>/cryptool"
+
 [profile.release]
 lto = true
 codegen-units = 1
