@@ -1,0 +1,10 @@
+[package]
+name = "cryptool-core"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+secrecy = "0.8"
+zeroize = "1"

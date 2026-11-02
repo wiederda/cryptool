@@ -1,0 +1,20 @@
+[package]
+name = "cryptool-lib"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+cryptool-core = { path = "../core" }
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+hkdf = "0.12"
+ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
+pgp = "0.21"
+rand = "0.8"
+secrecy = "0.8"
+sha2 = "0.10"
+thiserror = "1"
+tar = { version = "0.4", default-features = false }
+walkdir = "2"
+zeroize = "1"
+zstd = "0.13"

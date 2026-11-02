@@ -1,0 +1,42 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Schlüsselmaterial und Geheimnisse: NIE einchecken ---
+*.sec.asc
+*.sec.gpg
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+pass*.txt
+pw*.txt
+*password*
+*passphrase*
+*.md
+
+# --- Erzeugte / verschlüsselte Testdaten ---
+*.ctx
+*.part
+*.pgp
+*.gpg
+*.pqc
+cryptool-key.*
+
+# --- IDE / Editor ---
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# --- Betriebssystem ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Release-Artefakte ---
+/dist/
+*.zip

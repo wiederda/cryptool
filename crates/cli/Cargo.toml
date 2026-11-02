@@ -1,0 +1,15 @@
+[package]
+name = "cryptool-cli"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "cryptool"
+path = "src/main.rs"
+
+[dependencies]
+cryptool-lib = { path = "../lib" }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+rpassword = "7"
+zeroize = "1"
