@@ -100,37 +100,6 @@ CTX unterstützt keinen Textmodus.
 
 ---
 
-## Selbst bauen (optional)
-
-Voraussetzungen:
-
-- Rust 1.88 oder neuer
-- Unter Windows: MSVC Build Tools (werden für Rust und `zstd` benötigt)
-- `zstd` bringt C-Code mit; ein C-Compiler ist daher erforderlich
-
-Bauen:
-
-```text
-cargo build --release
-```
-
-Ergebnis:
-
-```text
-target/release/cryptool       (Windows: cryptool.exe)
-target/release/cryptool-gui   (Windows: cryptool-gui.exe)
-```
-
-Tests ausführen:
-
-```text
-cargo test --workspace
-```
-
-Für Release-Archive und GitHub-Releases siehe `README-release.md`.
-
----
-
 ## Kommandozeile: Grundlagen
 
 ```text
@@ -347,5 +316,3 @@ crates/lib    öffentliche API, Datei-/Ordnerabläufe, OpenPGP und PQC
 crates/cli    Kommandozeilenprogramm `cryptool`
 crates/gui    Desktop-Oberfläche `cryptool-gui` (egui)
 ```
-
-Weitere technische Details stehen in `ARCHITECTURE.md`.
