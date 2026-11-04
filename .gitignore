@@ -16,7 +16,11 @@ pass*.txt
 pw*.txt
 *password*
 *passphrase*
-*.md
+README-release.md
+CANGES.md
+ARCHITECTURE.md
+*.sh
+*.json
 
 # --- Erzeugte / verschlüsselte Testdaten ---
 *.ctx

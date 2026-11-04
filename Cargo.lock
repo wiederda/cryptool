@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "cryptool-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "cryptool-lib",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "cryptool-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "cryptool-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cryptool-lib",
  "eframe",
@@ -1159,17 +1159,19 @@ dependencies = [
 
 [[package]]
 name = "cryptool-lib"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "chacha20poly1305",
  "cryptool-core",
  "hkdf",
+ "ml-dsa",
  "ml-kem",
  "pgp",
  "rand",
  "secrecy",
  "sha2",
+ "shake",
  "tar",
  "thiserror 1.0.69",
  "walkdir",
@@ -1251,7 +1253,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serdect 0.3.0",
  "sha3 0.10.9",
- "signature",
+ "signature 2.2.0",
  "subtle",
  "zeroize",
 ]
@@ -1476,7 +1478,7 @@ dependencies = [
  "pkcs8 0.10.2",
  "rfc6979",
  "sha2",
- "signature",
+ "signature 2.2.0",
  "zeroize",
 ]
 
@@ -1503,7 +1505,7 @@ dependencies = [
  "digest 0.10.7",
  "elliptic-curve",
  "rfc6979",
- "signature",
+ "signature 2.2.0",
  "spki 0.7.3",
 ]
 
@@ -1524,7 +1526,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8 0.10.2",
- "signature",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -2615,7 +2617,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
- "signature",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -2822,6 +2824,22 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "ml-dsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
+dependencies = [
+ "const-oid 0.10.2",
+ "crypto-common 0.2.2",
+ "ctutils",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8 0.11.0",
+ "shake",
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -3608,7 +3626,7 @@ dependencies = [
  "sha1-checked",
  "sha2",
  "sha3 0.10.9",
- "signature",
+ "signature 2.2.0",
  "smallvec",
  "snafu",
  "subtle",
@@ -4131,7 +4149,7 @@ dependencies = [
  "pkcs1",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
- "signature",
+ "signature 2.2.0",
  "spki 0.7.3",
  "subtle",
  "zeroize",
@@ -4439,6 +4457,16 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "digest 0.11.3",
+ "rand_core 0.10.1",
 ]
 
 [[package]]

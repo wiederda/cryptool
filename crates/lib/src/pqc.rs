@@ -1,16 +1,19 @@
-//! PQC-Modus außerhalb von OpenPGP: ML-KEM-768 + HKDF-SHA256 + XChaCha20-Poly1305.
+//! PQC-Modus außerhalb von OpenPGP: ML-KEM-768 + HKDF-SHA256 + XChaCha20-Poly1305
+//! sowie ML-DSA-65 für abgetrennte Dateisignaturen.
 //!
 //! Das Format ist bewusst eigenständig und versioniert. Es kombiniert ausschließlich
 //! standardisierte Bausteine:
 //!
 //! - **ML-KEM-768** (FIPS 203) zur Schlüsseleinigung (KEM),
 //! - **HKDF-SHA256** (RFC 5869) zur Ableitung des symmetrischen Schlüssels,
-//! - **XChaCha20-Poly1305** (RFC 8439 in der XChaCha-Variante) als AEAD/STREAM.
+//! - **XChaCha20-Poly1305** (RFC 8439 in der XChaCha-Variante) als AEAD/STREAM,
+//! - **ML-DSA-65** (FIPS 204) zum Signieren und Prüfen von Dateien.
 //!
 //! Es handelt sich nicht um eine selbst entworfene Hybrid-Kombination: Es gibt genau
-//! ein KEM und ein DEM. Die Authentizität öffentlicher Schlüssel muss außerhalb des
-//! Formats sichergestellt werden (z. B. über einen vertrauenswürdigen Kanal); anders
-//! als bei OpenPGP gibt es hier keine Selbstsignatur des Schlüssels.
+//! ein KEM, ein DEM und ein Signaturverfahren. Die Authentizität öffentlicher
+//! Schlüssel muss außerhalb des Formats sichergestellt werden (z. B. über einen
+//! vertrauenswürdigen Kanal); anders als bei OpenPGP gibt es hier keine
+//! Selbstsignatur des Schlüssels.
 //!
 //! ## Nachrichtenformat (alle Zahlen little-endian)
 //!
@@ -34,11 +37,23 @@
 //! ## Schlüsseldateien
 //!
 //! Öffentliche und geheime Schlüssel werden als ASCII-Armor (Base64) geschrieben,
-//! können aber auch binär gelesen werden. Der geheime Schlüssel enthält nur den
-//! 64-Byte-Seed von ML-KEM-768; dieser wird mit Argon2id und
+//! können aber auch binär gelesen werden. Version 1 enthält nur den 64-Byte-Seed
+//! von ML-KEM-768. Version 2 enthält zusätzlich einen ML-DSA-65-Schlüssel; der
+//! geheime Schlüssel speichert beide Seeds (KEM + Signatur) mit Argon2id und
 //! XChaCha20-Poly1305 passphrasegeschützt.
+//!
+//! ## Signaturdateien
+//!
+//! ```text
+//!  0..4    Magic "CTSG"
+//!  4       Version (1)
+//!  5       Signatur-ID (1 = ML-DSA-65)
+//!  6       Flags (0)
+//!  7..9    Länge der Unterzeichnerkennung (u16)
+//!  9..     Unterzeichnerkennung, Signaturlänge (u32), Signatur
+//! ```
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
@@ -50,15 +65,22 @@ use base64::Engine;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::aead::{Aead, OsRng};
 use hkdf::Hkdf;
-use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport};
+use ml_dsa::signature::{DigestSigner, DigestVerifier};
+use ml_dsa::{
+    KeyExport as DsaKeyExport, KeyInit as DsaKeyInit, Keypair as DsaKeypair, MlDsa65,
+    Signature as MlDsaSignature, SignatureEncoding, SigningKey as MlDsaSigningKey,
+    VerifyingKey as MlDsaVerifyingKey,
+};
+use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
 use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768, Seed};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use shake::Update;
 use zeroize::Zeroizing;
 
 use crate::engine::{
     extract_archive, remap_error, scan_dir, with_part_dir, with_part_file, write_dir_stream,
     write_file_stream, Dec, DecryptReader, Enc, EncryptWriter, Error, Fail, Progress, Report,
-    Result, Tracker, TAG_LEN,
+    Result, Tracker, VerifyReport, TAG_LEN,
 };
 use crate::{ExposeSecret, SecretString};
 
@@ -70,6 +92,10 @@ pub const TEXT_EXTENSION: &str = "pqc.asc";
 pub const PUBLIC_KEY_EXTENSION: &str = "pub.pqc";
 /// Endung für geheime Schlüsseldateien (z. B. `schluessel.sec.pqc`).
 pub const SECRET_KEY_EXTENSION: &str = "sec.pqc";
+/// Endung für binäre abgetrennte Signaturen.
+pub const SIGNATURE_EXTENSION: &str = "pqc.sig";
+/// Endung für ASCII-Armor-Signaturen.
+pub const SIGNATURE_ARMOR_EXTENSION: &str = "pqc.sig.asc";
 
 const MAGIC: &[u8; 4] = b"CTPQ";
 const VERSION: u8 = 1;
@@ -102,12 +128,24 @@ const MAX_CHUNK: u32 = 64 * 1024 * 1024;
 
 const PUBLIC_MAGIC: &[u8; 4] = b"CTPK";
 const SECRET_MAGIC: &[u8; 4] = b"CTSK";
-const KEY_VERSION: u8 = 1;
+const KEY_VERSION_V1: u8 = 1;
+const KEY_VERSION_V2: u8 = 2;
 const KEY_ALG_MLKEM768: u8 = 1;
+const KEY_ALG_MLDSA65: u8 = 1;
+
+const DSA_VK_LEN: usize = 1952; // ML-DSA-65
+const DSA_SEED_LEN: usize = 32;
+const DSA_SIG_LEN: usize = 3309; // ML-DSA-65
 
 const PUBLIC_KEY_LABEL: &str = "CRYPTOOL PQC PUBLIC KEY";
 const SECRET_KEY_LABEL: &str = "CRYPTOOL PQC SECRET KEY";
 const MESSAGE_LABEL: &str = "CRYPTOOL PQC MESSAGE";
+
+const SIGNATURE_MAGIC: &[u8; 4] = b"CTSG";
+const SIGNATURE_VERSION: u8 = 1;
+const SIGNATURE_ALG_MLDSA65: u8 = 1;
+const SIGNATURE_LABEL: &str = "CRYPTOOL PQC SIGNATURE";
+const SIGNATURE_FLAGS: u8 = 0;
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
@@ -118,10 +156,27 @@ fn invalid(message: impl Into<String>) -> Error {
 pub struct PublicKey {
     pub user_id: String,
     key: EncapsulationKey<MlKem768>,
+    signing_key: Option<MlDsaVerifyingKey<MlDsa65>>,
+}
+
+impl PublicKey {
+    /// `true`, wenn der Schlüssel eine Signaturprüfung erlaubt (Format v2).
+    pub fn can_verify(&self) -> bool {
+        self.signing_key.is_some()
+    }
+
+    /// Kurze, stabile Schlüsselkennung (erste 8 Byte des SHA-256-Fingerprints).
+    pub fn key_id(&self) -> String {
+        match &self.signing_key {
+            Some(key) => dsa_key_id(key),
+            None => kem_key_id(&self.key),
+        }
+    }
 }
 
 struct SecretKeyFile {
     user_id: String,
+    has_signing_key: bool,
     m_kib: u32,
     t: u32,
     p: u32,
@@ -212,22 +267,61 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
     ))
 }
 
+fn dsa_verifying_key(bytes: &[u8]) -> Result<MlDsaVerifyingKey<MlDsa65>> {
+    let raw = bytes
+        .try_into()
+        .map_err(|_| invalid("Öffentlicher ML-DSA-Schlüssel hat eine ungültige Länge"))?;
+    Ok(MlDsaVerifyingKey::<MlDsa65>::new(&raw))
+}
+
+fn short_id(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
+fn dsa_key_id(key: &MlDsaVerifyingKey<MlDsa65>) -> String {
+    let bytes = DsaKeyExport::to_bytes(key);
+    short_id(bytes.as_slice())
+}
+
+fn kem_key_id(key: &EncapsulationKey<MlKem768>) -> String {
+    let bytes = key.to_bytes();
+    short_id(bytes.as_slice())
+}
+
 fn parse_public_key(blob: &[u8]) -> Result<PublicKey> {
     let mut pos = 0usize;
     if take(blob, &mut pos, 4)? != PUBLIC_MAGIC {
         return Err(invalid("Keine cryptool-PQC-Schlüsseldatei"));
     }
-    if take(blob, &mut pos, 1)?[0] != KEY_VERSION {
+    let version = take(blob, &mut pos, 1)?[0];
+    if !matches!(version, KEY_VERSION_V1 | KEY_VERSION_V2) {
         return Err(invalid("Nicht unterstützte PQC-Schlüsselversion"));
     }
     if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLKEM768 {
         return Err(invalid("Nicht unterstützter PQC-Schlüsselalgorithmus"));
     }
+    let has_signing_key = if version == KEY_VERSION_V2 {
+        if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLDSA65 {
+            return Err(invalid("Nicht unterstützter PQC-Signaturalgorithmus"));
+        }
+        true
+    } else {
+        false
+    };
     let id_len = read_u16(blob, &mut pos)? as usize;
     let user_id = std::str::from_utf8(take(blob, &mut pos, id_len)?)
         .map_err(|_| invalid("Nutzerkennung im Schlüssel ist kein UTF-8"))?
         .to_owned();
     let ek_bytes = take(blob, &mut pos, KEM_EK_LEN)?;
+    let signing_key = if has_signing_key {
+        Some(dsa_verifying_key(take(blob, &mut pos, DSA_VK_LEN)?)?)
+    } else {
+        None
+    };
     if pos != blob.len() {
         return Err(invalid("PQC-Schlüsseldatei enthält unerwartete Daten"));
     }
@@ -236,7 +330,11 @@ fn parse_public_key(blob: &[u8]) -> Result<PublicKey> {
         .map_err(|_| invalid("Öffentlicher ML-KEM-Schlüssel hat eine ungültige Länge"))?;
     let key = EncapsulationKey::<MlKem768>::new(&raw)
         .map_err(|_| invalid("Öffentlicher ML-KEM-Schlüssel ist ungültig"))?;
-    Ok(PublicKey { user_id, key })
+    Ok(PublicKey {
+        user_id,
+        key,
+        signing_key,
+    })
 }
 
 fn parse_secret_key(blob: &[u8]) -> Result<SecretKeyFile> {
@@ -244,12 +342,21 @@ fn parse_secret_key(blob: &[u8]) -> Result<SecretKeyFile> {
     if take(blob, &mut pos, 4)? != SECRET_MAGIC {
         return Err(invalid("Keine cryptool-PQC-Schlüsseldatei"));
     }
-    if take(blob, &mut pos, 1)?[0] != KEY_VERSION {
+    let version = take(blob, &mut pos, 1)?[0];
+    if !matches!(version, KEY_VERSION_V1 | KEY_VERSION_V2) {
         return Err(invalid("Nicht unterstützte PQC-Schlüsselversion"));
     }
     if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLKEM768 {
         return Err(invalid("Nicht unterstützter PQC-Schlüsselalgorithmus"));
     }
+    let has_signing_key = if version == KEY_VERSION_V2 {
+        if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLDSA65 {
+            return Err(invalid("Nicht unterstützter PQC-Signaturalgorithmus"));
+        }
+        true
+    } else {
+        false
+    };
     let id_len = read_u16(blob, &mut pos)? as usize;
     let user_id = std::str::from_utf8(take(blob, &mut pos, id_len)?)
         .map_err(|_| invalid("Nutzerkennung im Schlüssel ist kein UTF-8"))?
@@ -265,7 +372,12 @@ fn parse_secret_key(blob: &[u8]) -> Result<SecretKeyFile> {
         .expect("Salt-Länge");
     let nonce: [u8; 24] = take(blob, &mut pos, 24)?.try_into().expect("Nonce-Länge");
     let ct_len = read_u32(blob, &mut pos)? as usize;
-    if ct_len != KEM_SEED_LEN + TAG_LEN {
+    let seed_len = if has_signing_key {
+        KEM_SEED_LEN + DSA_SEED_LEN
+    } else {
+        KEM_SEED_LEN
+    };
+    if ct_len != seed_len + TAG_LEN {
         return Err(invalid("Ungültige Länge des geschützten PQC-Schlüssels"));
     }
     let seed_ct = take(blob, &mut pos, ct_len)?.to_vec();
@@ -274,6 +386,7 @@ fn parse_secret_key(blob: &[u8]) -> Result<SecretKeyFile> {
     }
     Ok(SecretKeyFile {
         user_id,
+        has_signing_key,
         m_kib,
         t,
         p,
@@ -291,6 +404,7 @@ fn decrypt_seed(
     m_kib: u32,
     t: u32,
     p: u32,
+    seed_len: usize,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let key = cryptool_core::derive_key(passphrase.expose_secret(), salt, m_kib, t, p)
         .map_err(Error::Kdf)?;
@@ -298,7 +412,7 @@ fn decrypt_seed(
     let seed = cipher
         .decrypt(GenericArray::from_slice(nonce), seed_ct)
         .map_err(|_| Error::WrongPasswordOrCorrupt)?;
-    if seed.len() != KEM_SEED_LEN {
+    if seed.len() != seed_len {
         return Err(Error::Corrupt);
     }
     Ok(Zeroizing::new(seed))
@@ -309,9 +423,17 @@ pub fn load_public_key(path: &Path) -> Result<PublicKey> {
     parse_public_key(&read_key_file(path, PUBLIC_KEY_LABEL)?)
 }
 
-fn load_secret_seed(path: &Path, passphrase: SecretString) -> Result<(String, Zeroizing<Vec<u8>>)> {
+fn load_secret_seed(
+    path: &Path,
+    passphrase: SecretString,
+) -> Result<(String, bool, Zeroizing<Vec<u8>>)> {
     let blob = read_key_file(path, SECRET_KEY_LABEL)?;
     let parsed = parse_secret_key(&blob)?;
+    let seed_len = if parsed.has_signing_key {
+        KEM_SEED_LEN + DSA_SEED_LEN
+    } else {
+        KEM_SEED_LEN
+    };
     let seed = decrypt_seed(
         passphrase,
         &parsed.salt,
@@ -320,8 +442,9 @@ fn load_secret_seed(path: &Path, passphrase: SecretString) -> Result<(String, Ze
         parsed.m_kib,
         parsed.t,
         parsed.p,
+        seed_len,
     )?;
-    Ok((parsed.user_id, seed))
+    Ok((parsed.user_id, parsed.has_signing_key, seed))
 }
 
 /// Erzeugt ein ML-KEM-768-Schlüsselpaar. Beide Dateien werden als ASCII-Armor
@@ -348,38 +471,56 @@ pub fn generate_key(
     }
 
     let (dk, ek) = MlKem768::generate_keypair();
-    let seed = dk
+    let kem_seed = dk
         .to_seed()
         .ok_or_else(|| invalid("ML-KEM-Schlüssel konnte nicht serialisiert werden"))?;
 
-    // Öffentlicher Schlüssel: Nutzerkennung + roher Encapsulation-Key.
+    // Signaturschlüssel: ML-DSA-65 aus einem zufälligen 32-Byte-Seed.
+    let mut dsa_seed = [0u8; DSA_SEED_LEN];
+    use chacha20poly1305::aead::rand_core::RngCore;
+    OsRng.fill_bytes(&mut dsa_seed);
+    let dsa_seed_array: ml_dsa::Seed = (&dsa_seed[..])
+        .try_into()
+        .map_err(|_| invalid("ML-DSA-Seed hat eine ungültige Länge"))?;
+    let signing_key = MlDsaSigningKey::<MlDsa65>::from_seed(&dsa_seed_array);
+    let verifying_key = signing_key.verifying_key();
+    let vk_bytes = DsaKeyExport::to_bytes(&verifying_key);
+
+    // Öffentlicher Schlüssel (v2): Nutzerkennung + ML-KEM- + ML-DSA-Schlüssel.
     let ek_bytes = ek.to_bytes();
-    let mut public_blob = Vec::with_capacity(8 + user_id.len() + KEM_EK_LEN);
+    let mut public_blob = Vec::with_capacity(9 + user_id.len() + KEM_EK_LEN + DSA_VK_LEN);
     public_blob.extend_from_slice(PUBLIC_MAGIC);
-    public_blob.push(KEY_VERSION);
+    public_blob.push(KEY_VERSION_V2);
     public_blob.push(KEY_ALG_MLKEM768);
+    public_blob.push(KEY_ALG_MLDSA65);
     public_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
     public_blob.extend_from_slice(user_id.as_bytes());
     public_blob.extend_from_slice(ek_bytes.as_slice());
+    public_blob.extend_from_slice(vk_bytes.as_slice());
 
-    // Geheimer Schlüssel: Seed mit Argon2id + XChaCha20-Poly1305 geschützt.
+    // Geheimer Schlüssel (v2): beide Seeds mit Argon2id + XChaCha20-Poly1305
+    // geschützt.
+    let mut seed_blob = Zeroizing::new(Vec::with_capacity(KEM_SEED_LEN + DSA_SEED_LEN));
+    seed_blob.extend_from_slice(kem_seed.as_slice());
+    seed_blob.extend_from_slice(&dsa_seed);
+
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; 24];
-    use chacha20poly1305::aead::rand_core::RngCore;
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
     let key = cryptool_core::derive_key(passphrase.expose_secret(), &salt, KDF_M_KIB, KDF_T, KDF_P)
         .map_err(Error::Kdf)?;
     let cipher = cryptool_core::xchacha20poly1305(&key);
     let seed_ct = cipher
-        .encrypt(GenericArray::from_slice(&nonce), seed.as_slice())
+        .encrypt(GenericArray::from_slice(&nonce), seed_blob.as_slice())
         .map_err(|_| Error::Crypto)?;
 
     let mut secret_blob =
-        Vec::with_capacity(8 + user_id.len() + 12 + SALT_LEN + 24 + 4 + KEM_SEED_LEN + TAG_LEN);
+        Vec::with_capacity(9 + user_id.len() + 12 + SALT_LEN + 24 + 4 + seed_ct.len());
     secret_blob.extend_from_slice(SECRET_MAGIC);
-    secret_blob.push(KEY_VERSION);
+    secret_blob.push(KEY_VERSION_V2);
     secret_blob.push(KEY_ALG_MLKEM768);
+    secret_blob.push(KEY_ALG_MLDSA65);
     secret_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
     secret_blob.extend_from_slice(user_id.as_bytes());
     secret_blob.extend_from_slice(&KDF_M_KIB.to_le_bytes());
@@ -515,9 +656,12 @@ fn message_key(
     secret_key_file: &Path,
     passphrase: SecretString,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let (_user_id, seed) = load_secret_seed(secret_key_file, passphrase)?;
-    let seed: Seed = seed
+    let (_user_id, _has_signing_key, seed) = load_secret_seed(secret_key_file, passphrase)?;
+    let kem_seed = seed
         .as_slice()
+        .get(..KEM_SEED_LEN)
+        .ok_or_else(|| invalid("PQC-Schlüssel hat eine ungültige Länge"))?;
+    let seed: Seed = kem_seed
         .try_into()
         .map_err(|_| invalid("PQC-Schlüssel hat eine ungültige Länge"))?;
     let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
@@ -687,6 +831,217 @@ pub fn decrypt_text(
     String::from_utf8(plain).map_err(|_| invalid("Der entschlüsselte Inhalt ist kein UTF-8-Text"))
 }
 
+// ---------------------------------------------------------------- Signaturen
+
+/// Liest eine Signaturdatei (binär oder ASCII-Armor).
+fn read_signature(path: &Path) -> Result<(String, Vec<u8>)> {
+    let blob = read_key_file(path, SIGNATURE_LABEL)?;
+    let mut pos = 0usize;
+    if take(&blob, &mut pos, 4)? != SIGNATURE_MAGIC {
+        return Err(invalid("Keine cryptool-PQC-Signaturdatei"));
+    }
+    if take(&blob, &mut pos, 1)?[0] != SIGNATURE_VERSION {
+        return Err(invalid("Nicht unterstützte PQC-Signaturversion"));
+    }
+    if take(&blob, &mut pos, 1)?[0] != SIGNATURE_ALG_MLDSA65 {
+        return Err(invalid("Nicht unterstützter PQC-Signaturalgorithmus"));
+    }
+    if take(&blob, &mut pos, 1)?[0] != SIGNATURE_FLAGS {
+        return Err(invalid("Unbekannte Flags in der PQC-Signaturdatei"));
+    }
+    let id_len = read_u16(&blob, &mut pos)? as usize;
+    let signer = std::str::from_utf8(take(&blob, &mut pos, id_len)?)
+        .map_err(|_| invalid("Unterzeichnerkennung ist kein UTF-8"))?
+        .to_owned();
+    let sig_len = read_u32(&blob, &mut pos)? as usize;
+    if sig_len != DSA_SIG_LEN {
+        return Err(invalid("Ungültige Länge der PQC-Signatur"));
+    }
+    let signature = take(&blob, &mut pos, sig_len)?.to_vec();
+    if pos != blob.len() {
+        return Err(invalid("PQC-Signaturdatei enthält unerwartete Daten"));
+    }
+    Ok((signer, signature))
+}
+
+/// Liest eine Datei blockweise, meldet Fortschritt und erlaubt Abbruch.
+struct DigestReader<'a> {
+    inner: File,
+    tracker: Tracker<'a>,
+    cancel: &'a AtomicBool,
+}
+
+impl Read for DigestReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("abgebrochen"));
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.tracker.add(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+/// Signiert eine Datei mit dem geheimen ML-DSA-Schlüssel und schreibt eine
+/// abgetrennte Signaturdatei (binär oder ASCII-Armor).
+pub fn sign_path(
+    input: &Path,
+    output: &Path,
+    secret_key_file: &Path,
+    passphrase: SecretString,
+    armored: bool,
+    force: bool,
+    on_progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if input.is_dir() {
+        return Err(invalid("Signieren wird nur für einzelne Dateien unterstützt"));
+    }
+    let (user_id, has_signing_key, seed) = load_secret_seed(secret_key_file, passphrase)?;
+    if !has_signing_key {
+        return Err(invalid(
+            "Der PQC-Schlüssel (Format v1) enthält keinen Signaturschlüssel; bitte ein neues Schlüsselpaar erzeugen",
+        ));
+    }
+    let dsa_seed: ml_dsa::Seed = seed
+        .as_slice()
+        .get(KEM_SEED_LEN..)
+        .ok_or_else(|| invalid("PQC-Schlüssel hat eine ungültige Länge"))?
+        .try_into()
+        .map_err(|_| invalid("ML-DSA-Seed hat eine ungültige Länge"))?;
+    let signing_key = MlDsaSigningKey::<MlDsa65>::from_seed(&dsa_seed);
+
+    let total = fs::metadata(input)?.len();
+    let reader = RefCell::new(DigestReader {
+        inner: File::open(input)?,
+        tracker: Tracker::new(0, total, on_progress),
+        cancel,
+    });
+    let io_err: RefCell<Option<Error>> = RefCell::new(None);
+    let signature = signing_key.try_sign_digest(|hasher| {
+        let mut r = reader.borrow_mut();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) => {
+                    *io_err.borrow_mut() = Some(Error::Io(e));
+                    return Err(ml_dsa::signature::Error::new());
+                }
+            }
+        }
+        Ok(())
+    });
+    let signature = match signature {
+        Ok(sig) => {
+            if let Some(e) = io_err.into_inner() {
+                return Err(e);
+            }
+            sig
+        }
+        Err(_) => {
+            if let Some(e) = io_err.into_inner() {
+                return Err(e);
+            }
+            return Err(if cancel.load(Ordering::Relaxed) {
+                Error::Canceled
+            } else {
+                Error::Crypto
+            });
+        }
+    };
+    let encoded = signature.to_bytes();
+
+    let mut blob = Vec::with_capacity(9 + user_id.len() + 4 + DSA_SIG_LEN);
+    blob.extend_from_slice(SIGNATURE_MAGIC);
+    blob.push(SIGNATURE_VERSION);
+    blob.push(SIGNATURE_ALG_MLDSA65);
+    blob.push(SIGNATURE_FLAGS);
+    blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
+    blob.extend_from_slice(user_id.as_bytes());
+    blob.extend_from_slice(&(DSA_SIG_LEN as u32).to_le_bytes());
+    blob.extend_from_slice(encoded.as_slice());
+
+    with_part_file(output, force, |w| {
+        if armored {
+            w.write_all(armor(SIGNATURE_LABEL, &blob).as_bytes())?;
+        } else {
+            w.write_all(&blob)?;
+        }
+        Ok(())
+    })
+}
+
+/// Prüft eine abgetrennte PQC-Signatur gegen eine Datei.
+pub fn verify_path(
+    input: &Path,
+    signature_file: &Path,
+    public_key_file: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<VerifyReport> {
+    if input.is_dir() {
+        return Err(invalid("Signaturprüfung wird nur für einzelne Dateien unterstützt"));
+    }
+    let public = load_public_key(public_key_file)?;
+    let verifying_key = public.signing_key.as_ref().ok_or_else(|| {
+        invalid("Der PQC-Schlüssel (Format v1) enthält keinen Signaturschlüssel")
+    })?;
+    let (signer, sig_bytes) = read_signature(signature_file)?;
+    let signature = MlDsaSignature::<MlDsa65>::try_from(sig_bytes.as_slice())
+        .map_err(|_| invalid("PQC-Signatur ist ungültig kodiert"))?;
+
+    let total = fs::metadata(input)?.len();
+    let reader = RefCell::new(DigestReader {
+        inner: File::open(input)?,
+        tracker: Tracker::new(0, total, on_progress),
+        cancel,
+    });
+    let io_err: RefCell<Option<Error>> = RefCell::new(None);
+    let result = verifying_key.verify_digest(
+        |hasher| {
+            let mut r = reader.borrow_mut();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(e) => {
+                        *io_err.borrow_mut() = Some(Error::Io(e));
+                        return Err(ml_dsa::signature::Error::new());
+                    }
+                }
+            }
+            Ok(())
+        },
+        &signature,
+    );
+    match result {
+        Ok(()) => Ok(VerifyReport {
+            signer: if signer.is_empty() {
+                public.user_id.clone()
+            } else {
+                signer
+            },
+            key_id: public.key_id(),
+            created: None,
+        }),
+        Err(_) => {
+            if let Some(e) = io_err.into_inner() {
+                return Err(e);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                Err(Error::Canceled)
+            } else {
+                Err(Error::SignatureInvalid)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +1190,218 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::WrongPasswordOrCorrupt));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sign_and_verify_roundtrip() {
+        let root = std::env::temp_dir().join("cryptool-pqc-sign-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let secret_out = root.join("s.sec.pqc");
+        let public_out = root.join("p.pub.pqc");
+        let pw = SecretString::new("testpw".to_owned());
+        generate_key(
+            "Signer <s@example.de>",
+            pw.clone(),
+            &secret_out,
+            &public_out,
+            true,
+        )
+        .unwrap();
+
+        let data = root.join("d.txt");
+        fs::write(&data, b"zu signierende datei").unwrap();
+        let cancel = AtomicBool::new(false);
+
+        // Binäre Signatur
+        let sig = root.join("d.txt.pqc.sig");
+        sign_path(
+            &data,
+            &sig,
+            &secret_out,
+            pw.clone(),
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        let report = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap();
+        assert_eq!(report.signer, "Signer <s@example.de>");
+        assert!(!report.key_id.is_empty());
+        assert!(report.created.is_none());
+
+        // ASCII-Armor-Signatur
+        let armored = root.join("d.txt.pqc.sig.asc");
+        sign_path(
+            &data,
+            &armored,
+            &secret_out,
+            pw.clone(),
+            true,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&armored)
+            .unwrap()
+            .starts_with("-----BEGIN CRYPTOOL PQC SIGNATURE-----"));
+        verify_path(
+            &data,
+            &armored,
+            &public_out,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+
+        // Manipulierte Datei wird abgelehnt.
+        fs::write(&data, b"manipuliert").unwrap();
+        let err = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap_err();
+        assert!(matches!(err, Error::SignatureInvalid));
+
+        // Falscher öffentlicher Schlüssel wird abgelehnt.
+        fs::write(&data, b"zu signierende datei").unwrap();
+        let other_secret = root.join("o.sec.pqc");
+        let other_public = root.join("o.pub.pqc");
+        generate_key(
+            "Andere <a@example.de>",
+            pw,
+            &other_secret,
+            &other_public,
+            true,
+        )
+        .unwrap();
+        let err = verify_path(&data, &sig, &other_public, &mut no_progress(), &cancel).unwrap_err();
+        assert!(matches!(err, Error::SignatureInvalid));
+
+        // Ordner werden abgelehnt.
+        let dir = root.join("verzeichnis");
+        fs::create_dir_all(&dir).unwrap();
+        let err = sign_path(
+            &dir,
+            &root.join("dir.pqc.sig"),
+            &secret_out,
+            SecretString::new("testpw".to_owned()),
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Schreibt ein Schlüsselpaar im alten v1-Format (nur ML-KEM).
+    fn write_v1_keypair(
+        root: &Path,
+        user_id: &str,
+        passphrase: &SecretString,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use chacha20poly1305::aead::rand_core::RngCore;
+        let (dk, ek) = MlKem768::generate_keypair();
+        let seed = dk.to_seed().unwrap();
+        let ek_bytes = ek.to_bytes();
+
+        let mut public_blob = Vec::new();
+        public_blob.extend_from_slice(PUBLIC_MAGIC);
+        public_blob.push(KEY_VERSION_V1);
+        public_blob.push(KEY_ALG_MLKEM768);
+        public_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
+        public_blob.extend_from_slice(user_id.as_bytes());
+        public_blob.extend_from_slice(ek_bytes.as_slice());
+
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce);
+        let key = cryptool_core::derive_key(
+            passphrase.expose_secret(),
+            &salt,
+            KDF_M_KIB,
+            KDF_T,
+            KDF_P,
+        )
+        .unwrap();
+        let seed_ct = cryptool_core::xchacha20poly1305(&key)
+            .encrypt(GenericArray::from_slice(&nonce), seed.as_slice())
+            .unwrap();
+
+        let mut secret_blob = Vec::new();
+        secret_blob.extend_from_slice(SECRET_MAGIC);
+        secret_blob.push(KEY_VERSION_V1);
+        secret_blob.push(KEY_ALG_MLKEM768);
+        secret_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
+        secret_blob.extend_from_slice(user_id.as_bytes());
+        secret_blob.extend_from_slice(&KDF_M_KIB.to_le_bytes());
+        secret_blob.extend_from_slice(&KDF_T.to_le_bytes());
+        secret_blob.extend_from_slice(&KDF_P.to_le_bytes());
+        secret_blob.extend_from_slice(&salt);
+        secret_blob.extend_from_slice(&nonce);
+        secret_blob.extend_from_slice(&(seed_ct.len() as u32).to_le_bytes());
+        secret_blob.extend_from_slice(&seed_ct);
+
+        let secret_out = root.join("v1.sec.pqc");
+        let public_out = root.join("v1.pub.pqc");
+        write_key_file(&secret_out, SECRET_KEY_LABEL, &secret_blob, true).unwrap();
+        write_key_file(&public_out, PUBLIC_KEY_LABEL, &public_blob, true).unwrap();
+        (secret_out, public_out)
+    }
+
+    #[test]
+    fn v1_keys_still_encrypt_but_cannot_sign() {
+        let root = std::env::temp_dir().join("cryptool-pqc-v1-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let pw = SecretString::new("testpw".to_owned());
+        let (secret_out, public_out) = write_v1_keypair(&root, "Alt <a@example.de>", &pw);
+
+        let public = load_public_key(&public_out).unwrap();
+        assert!(!public.can_verify());
+
+        let cancel = AtomicBool::new(false);
+        let data = root.join("d.txt");
+        fs::write(&data, b"v1 kompatibel").unwrap();
+        let enc = root.join("d.pqc");
+        encrypt_path(
+            &data,
+            &enc,
+            &public_out,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        let out = root.join("d.out");
+        decrypt_path(
+            &enc,
+            &out,
+            &secret_out,
+            pw.clone(),
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&out).unwrap(), b"v1 kompatibel");
+
+        let err = sign_path(
+            &data,
+            &root.join("d.pqc.sig"),
+            &secret_out,
+            pw,
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+
         let _ = fs::remove_dir_all(&root);
     }
 }

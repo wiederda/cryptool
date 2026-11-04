@@ -101,6 +101,8 @@ pub enum Error {
     Invalid(String),
     #[error("OpenPGP-Fehler: {0}")]
     Pgp(String),
+    #[error("Signatur ist ungültig")]
+    SignatureInvalid,
     #[error("abgebrochen")]
     Canceled,
 }
@@ -231,6 +233,17 @@ pub struct Progress {
 pub struct Report {
     /// Symlinks und Sonderdateien in Ordnern, die nicht aufgenommen wurden.
     pub skipped: u64,
+}
+
+/// Ergebnis einer erfolgreichen Signaturprüfung.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    /// Nutzerkennung des Unterzeichners.
+    pub signer: String,
+    /// Fingerprint bzw. Schlüsselkennung des verwendeten Schlüssels (Hex).
+    pub key_id: String,
+    /// Signaturzeitpunkt als Unix-Sekunden, falls im Format enthalten.
+    pub created: Option<u64>,
 }
 
 pub(crate) struct Tracker<'a> {

@@ -5,6 +5,7 @@
 //!   exportiert als ASCII-Armor (`.sec.asc` / `.pub.asc`).
 //! - Dateien und Ordner für einen Empfänger verschlüsseln (binär oder ASCII-Armor).
 //! - Nachrichten mit dem eigenen geheimen Schlüssel entschlüsseln.
+//! - Einzelne Dateien abgetrennt signieren und Signaturen prüfen (`.sig` / `.sig.asc`).
 //!
 //! Ordner werden wie beim CTX-Modus als zstd-komprimiertes tar-Archiv als
 //! Klartextquelle gestreamt; vor den tar+zstd-Stream wird eine feste Kennung
@@ -23,19 +24,20 @@ use std::thread;
 use std::time::Duration;
 
 use pgp::composed::{
-    ArmorOptions, Deserializable, EncryptionCaps, KeyType, Message, MessageBuilder,
-    SecretKeyParamsBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey,
+    ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType, Message,
+    MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey,
     SubkeyParamsBuilder,
 };
 use pgp::crypto::aead::{AeadAlgorithm, ChunkSize};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::types::{KeyDetails, Password};
+use pgp::ser::Serialize;
+use pgp::types::{KeyDetails, Password, SigningKey, VerifyingKey};
 use rand::thread_rng;
 use zeroize::Zeroize;
 
 use crate::engine::{
     self, part_path, scan_dir, with_part_dir, with_part_file, Error, Progress, Report, Result,
-    Tracker,
+    Tracker, VerifyReport,
 };
 use crate::{ExposeSecret, SecretString};
 
@@ -43,6 +45,10 @@ use crate::{ExposeSecret, SecretString};
 pub const EXTENSION: &str = "pgp";
 /// Dateierweiterung für ASCII-Armor-Ausgaben.
 pub const ARMOR_EXTENSION: &str = "asc";
+/// Dateierweiterung für binäre abgetrennte Signaturen.
+pub const SIGNATURE_EXTENSION: &str = "sig";
+/// Dateierweiterung für ASCII-Armor-Signaturen.
+pub const SIGNATURE_ARMOR_EXTENSION: &str = "sig.asc";
 
 const ZSTD_LEVEL: i32 = 3;
 const NAME_SUFFIX_ARCHIVE: &str = ".tar.zst";
@@ -108,6 +114,25 @@ fn pick_encryption_key(key: &SignedPublicKey) -> Result<&SignedPublicSubKey> {
         })
 }
 
+/// Wählt einen Signaturschlüssel. Bevorzugt einen dafür markierten
+/// Unterschlüssel; bei älteren cryptool-Schlüsseln (Primärschlüssel ohne
+/// Signatur-Flag) wird der algorithmisch signaturfähige Primärschlüssel genutzt.
+fn pick_signing_key(key: &SignedSecretKey) -> Result<Box<&dyn SigningKey>> {
+    for sub in &key.secret_subkeys {
+        if sub.algorithm().can_sign()
+            && sub.signatures.iter().any(|sig| sig.key_flags().sign())
+        {
+            return Ok(Box::new(&sub.key));
+        }
+    }
+    if key.primary_key.algorithm().can_sign() {
+        return Ok(Box::new(&key.primary_key));
+    }
+    Err(Error::Pgp(
+        "Der Schlüssel enthält keinen Signaturschlüssel".into(),
+    ))
+}
+
 /// Erzeugt ein geheim/öffentliches Schlüsselfpaar und schreibt beide als
 /// ASCII-Armor in `secret_out` bzw. `public_out`.
 pub fn generate_key(
@@ -129,7 +154,7 @@ pub fn generate_key(
     params
         .key_type(KeyType::Ed25519)
         .can_certify(true)
-        .can_sign(false)
+        .can_sign(true)
         .can_encrypt(EncryptionCaps::None)
         .can_authenticate(false)
         .primary_user_id(user_id.to_string())
@@ -774,6 +799,161 @@ pub fn decrypt_text(
         .map_err(|_| Error::Invalid("Der entschlüsselte Inhalt ist kein UTF-8-Text".into()))
 }
 
+/// Primäre Nutzerkennung eines öffentlichen Schlüssels als Text.
+fn user_id_of(key: &SignedPublicKey) -> String {
+    key.details
+        .users
+        .iter()
+        .find(|user| user.is_primary())
+        .or_else(|| key.details.users.first())
+        .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+        .unwrap_or_default()
+}
+
+fn key_id_hex(key: &impl KeyDetails) -> String {
+    format!("{:X}", key.fingerprint())
+}
+
+/// Prüft, ob die Signatur laut Issuer-Angabe zu `key` gehört. Signaturen ohne
+/// Issuer-Angabe werden als Kandidaten akzeptiert.
+fn signature_matches(sig: &DetachedSignature, key: &impl KeyDetails) -> bool {
+    let fps = sig.signature.issuer_fingerprint();
+    let ids = sig.signature.issuer_key_id();
+    if fps.is_empty() && ids.is_empty() {
+        return true;
+    }
+    fps.iter().any(|fp| *fp == &key.fingerprint())
+        || ids.iter().any(|id| *id == &key.legacy_key_id())
+}
+
+fn try_verify_detached<K: VerifyingKey>(
+    sig: &DetachedSignature,
+    key: &K,
+    input: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let total = fs::metadata(input)?.len();
+    let source = FileSource {
+        inner: File::open(input)?,
+        tracker: Tracker::new(0, total, on_progress),
+        cancel,
+    };
+    match sig.signature.verify(key, source) {
+        Ok(()) => Ok(()),
+        Err(_) if cancel.load(Ordering::Relaxed) => Err(Error::Canceled),
+        Err(_) => Err(Error::SignatureInvalid),
+    }
+}
+
+/// Signiert eine einzelne Datei abgetrennt mit dem eigenen geheimen Schlüssel.
+pub fn sign_path(
+    input: &Path,
+    output: &Path,
+    secret_key_file: &Path,
+    passphrase: SecretString,
+    armor: bool,
+    force: bool,
+    on_progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if input.is_dir() {
+        return Err(Error::Invalid(
+            "Signieren wird nur für einzelne Dateien unterstützt".into(),
+        ));
+    }
+    let secret = load_secret_key(secret_key_file)?;
+    let password = to_password(passphrase.expose_secret());
+    let signing_key = pick_signing_key(&secret)?;
+    let hash_alg = signing_key.hash_alg();
+    let total = fs::metadata(input)?.len();
+    let source = FileSource {
+        inner: File::open(input)?,
+        tracker: Tracker::new(0, total, on_progress),
+        cancel,
+    };
+
+    let signature = DetachedSignature::sign_binary_data(
+        thread_rng(),
+        &signing_key,
+        &password,
+        hash_alg,
+        source,
+    );
+    let signature = match signature {
+        Ok(sig) => sig,
+        Err(_) if cancel.load(Ordering::Relaxed) => return Err(Error::Canceled),
+        Err(e) => return Err(pgp_err(e)),
+    };
+
+    with_part_file(output, force, |w| {
+        if armor {
+            signature
+                .to_armored_writer(w, ArmorOptions::default())
+                .map_err(pgp_err)
+        } else {
+            signature.to_writer(w).map_err(pgp_err)
+        }
+    })
+}
+
+/// Prüft eine abgetrennte PGP-Signatur gegen eine Datei.
+pub fn verify_path(
+    input: &Path,
+    signature_file: &Path,
+    public_key_file: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<VerifyReport> {
+    if input.is_dir() {
+        return Err(Error::Invalid(
+            "Signaturprüfung wird nur für einzelne Dateien unterstützt".into(),
+        ));
+    }
+    let public = load_public_key(public_key_file)?;
+    let bytes = fs::read(signature_file)?;
+    let (sig, _) = DetachedSignature::from_reader_single(&bytes[..]).map_err(pgp_err)?;
+
+    let signer = user_id_of(&public);
+    let created = sig.signature.created().map(|t| t.as_secs() as u64);
+    let has_issuer = !sig.signature.issuer_fingerprint().is_empty()
+        || !sig.signature.issuer_key_id().is_empty();
+    let mut last_error = None;
+
+    for sub in &public.public_subkeys {
+        if has_issuer && !signature_matches(&sig, sub) {
+            continue;
+        }
+        match try_verify_detached(&sig, sub, input, &mut *on_progress, cancel) {
+            Ok(()) => {
+                return Ok(VerifyReport {
+                    signer,
+                    key_id: key_id_hex(sub),
+                    created,
+                });
+            }
+            Err(e) if matches!(e, Error::Canceled) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    if !has_issuer || signature_matches(&sig, &public) {
+        match try_verify_detached(&sig, &public, input, &mut *on_progress, cancel) {
+            Ok(()) => {
+                return Ok(VerifyReport {
+                    signer,
+                    key_id: key_id_hex(&public),
+                    created,
+                });
+            }
+            Err(e) if matches!(e, Error::Canceled) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.unwrap_or(Error::SignatureInvalid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +1043,131 @@ mod tests {
             fs::read(dir_ret.join("sub").join("b.txt")).unwrap(),
             b"UNTERORDNER"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sign_and_verify_roundtrip() {
+        let root = std::env::temp_dir().join("cryptool-pgp-sign-test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let secret_out = root.join("s.sec.asc");
+        let public_out = root.join("p.pub.asc");
+        let pw = SecretString::new("testpw".to_owned());
+        generate_key(
+            "Signer <s@example.de>",
+            pw.clone(),
+            &secret_out,
+            &public_out,
+            true,
+        )
+        .unwrap();
+
+        let data = root.join("d.txt");
+        fs::write(&data, b"zu signierende datei").unwrap();
+        let cancel = AtomicBool::new(false);
+
+        // Binäre Signatur
+        let sig = root.join("d.txt.sig");
+        sign_path(
+            &data,
+            &sig,
+            &secret_out,
+            pw.clone(),
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert!(sig.exists());
+        let report = verify_path(
+            &data,
+            &sig,
+            &public_out,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.signer.contains("Signer"));
+        assert!(report.key_id.len() >= 16);
+        assert!(report.created.is_some());
+
+        // ASCII-Armor-Signatur
+        let armored = root.join("d.txt.sig.asc");
+        sign_path(
+            &data,
+            &armored,
+            &secret_out,
+            pw.clone(),
+            true,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&armored)
+            .unwrap()
+            .starts_with("-----BEGIN PGP SIGNATURE-----"));
+        verify_path(
+            &data,
+            &armored,
+            &public_out,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+
+        // Manipulierte Datei wird abgelehnt.
+        fs::write(&data, b"manipuliert").unwrap();
+        let err = verify_path(
+            &data,
+            &sig,
+            &public_out,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SignatureInvalid));
+
+        // Falscher öffentlicher Schlüssel wird abgelehnt.
+        fs::write(&data, b"zu signierende datei").unwrap();
+        let other_secret = root.join("o.sec.asc");
+        let other_public = root.join("o.pub.asc");
+        generate_key(
+            "Andere <a@example.de>",
+            pw,
+            &other_secret,
+            &other_public,
+            true,
+        )
+        .unwrap();
+        let err = verify_path(
+            &data,
+            &sig,
+            &other_public,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SignatureInvalid));
+
+        // Ordner werden abgelehnt.
+        let dir = root.join("verzeichnis");
+        fs::create_dir_all(&dir).unwrap();
+        let err = sign_path(
+            &dir,
+            &root.join("dir.sig"),
+            &secret_out,
+            SecretString::new("testpw".to_owned()),
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
 
         let _ = fs::remove_dir_all(&root);
     }

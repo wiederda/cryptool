@@ -9,9 +9,11 @@ cryptool-core = { path = "../core" }
 base64 = "0.22"
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
 hkdf = "0.12"
+ml-dsa = "0.1.2"
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
 pgp = "0.21"
 rand = "0.8"
+shake = "0.1"
 secrecy = "0.8"
 sha2 = "0.10"
 thiserror = "1"

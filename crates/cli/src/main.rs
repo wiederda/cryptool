@@ -49,16 +49,24 @@ enum PgpCmd {
     Encrypt(PgpEncryptArgs),
     /// PGP-Nachricht mit dem geheimen Schlüssel entschlüsseln
     Decrypt(PgpDecryptArgs),
+    /// Einzelne Datei abgetrennt signieren
+    Sign(PgpSignArgs),
+    /// Abgetrennte PGP-Signatur prüfen
+    Verify(PgpVerifyArgs),
 }
 
 #[derive(Subcommand)]
 enum PqcCmd {
-    /// ML-KEM-768-Schlüsselpaar erzeugen
+    /// ML-KEM-768/ML-DSA-65-Schlüsselpaar erzeugen
     Keygen(PqcKeygenArgs),
     /// Datei oder Ordner für einen Empfänger verschlüsseln
     Encrypt(PqcEncryptArgs),
     /// PQC-Nachricht mit dem geheimen Schlüssel entschlüsseln
     Decrypt(PqcDecryptArgs),
+    /// Einzelne Datei abgetrennt signieren
+    Sign(PqcSignArgs),
+    /// Abgetrennte PQC-Signatur prüfen
+    Verify(PqcVerifyArgs),
 }
 
 /// Gemeinsame Passwort-Argumente (lesbar für Skripte und interaktiv).
@@ -177,6 +185,44 @@ struct PgpDecryptArgs {
 }
 
 #[derive(Args)]
+struct PgpSignArgs {
+    /// Eingabe: die zu signierende Datei (kein Ordner)
+    input: PathBuf,
+    /// Signaturdatei (Standard: <eingabe>.sig bzw. <eingabe>.sig.asc)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Eigener geheimer Schlüssel (.sec.asc oder binär)
+    #[arg(short = 'k', long, value_name = "DATEI")]
+    key: PathBuf,
+    #[command(flatten)]
+    password: PasswordArgs,
+    /// Signatur als ASCII-Armor (.sig.asc) statt binär (.sig)
+    #[arg(long)]
+    armor: bool,
+    /// Vorhandene Signaturdatei überschreiben
+    #[arg(short, long)]
+    force: bool,
+    /// Keine Fortschrittsanzeige und keine Hinweise
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Args)]
+struct PgpVerifyArgs {
+    /// Eingabe: die zu prüfende Datei
+    input: PathBuf,
+    /// Signaturdatei (Standard: <eingabe>.sig oder <eingabe>.sig.asc)
+    #[arg(short = 's', long, value_name = "DATEI")]
+    signature: Option<PathBuf>,
+    /// Öffentlicher Schlüssel des Unterzeichners (.pub.asc oder binär)
+    #[arg(short = 'k', long, value_name = "DATEI")]
+    key: PathBuf,
+    /// Keine Fortschrittsanzeige und keine Hinweise
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Args)]
 struct PqcKeygenArgs {
     /// Kennung für den Schlüssel, z. B. "Anna Beispiel <anna@example.com>"
     user_id: String,
@@ -235,6 +281,44 @@ struct PqcDecryptArgs {
 }
 
 #[derive(Args)]
+struct PqcSignArgs {
+    /// Eingabe: die zu signierende Datei (kein Ordner)
+    input: PathBuf,
+    /// Signaturdatei (Standard: <eingabe>.pqc.sig bzw. <eingabe>.pqc.sig.asc)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Eigener geheimer Schlüssel (.sec.pqc oder binär)
+    #[arg(short = 'k', long, value_name = "DATEI")]
+    key: PathBuf,
+    #[command(flatten)]
+    password: PasswordArgs,
+    /// Signatur als ASCII-Armor (.pqc.sig.asc) statt binär (.pqc.sig)
+    #[arg(long)]
+    armor: bool,
+    /// Vorhandene Signaturdatei überschreiben
+    #[arg(short, long)]
+    force: bool,
+    /// Keine Fortschrittsanzeige und keine Hinweise
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Args)]
+struct PqcVerifyArgs {
+    /// Eingabe: die zu prüfende Datei
+    input: PathBuf,
+    /// Signaturdatei (Standard: <eingabe>.pqc.sig oder <eingabe>.pqc.sig.asc)
+    #[arg(short = 's', long, value_name = "DATEI")]
+    signature: Option<PathBuf>,
+    /// Öffentlicher Schlüssel des Unterzeichners (.pub.pqc oder binär)
+    #[arg(short = 'k', long, value_name = "DATEI")]
+    key: PathBuf,
+    /// Keine Fortschrittsanzeige und keine Hinweise
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Args)]
 struct CryptArgs {
     /// Eingabe: Datei oder Ordner (beim Entschlüsseln: die .ctx-Datei)
     input: PathBuf,
@@ -253,6 +337,7 @@ struct CryptArgs {
 
 // Exit-Codes
 const EXIT_ERROR: u8 = 1;
+const EXIT_SIGNATURE_INVALID: u8 = 2;
 const EXIT_WRONG_PASSWORD: u8 = 3;
 const EXIT_CANCELED: u8 = 130;
 
@@ -263,6 +348,7 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("Fehler: {e}");
             ExitCode::from(match e {
+                ct::Error::SignatureInvalid => EXIT_SIGNATURE_INVALID,
                 ct::Error::WrongPasswordOrCorrupt => EXIT_WRONG_PASSWORD,
                 ct::Error::Canceled => EXIT_CANCELED,
                 _ => EXIT_ERROR,
@@ -430,6 +516,8 @@ fn pgp_run(cmd: PgpCmd) -> ct::Result<()> {
         PgpCmd::Keygen(a) => pgp_keygen(a),
         PgpCmd::Encrypt(a) => pgp_encrypt(a, &cancel),
         PgpCmd::Decrypt(a) => pgp_decrypt(a, &cancel),
+        PgpCmd::Sign(a) => pgp_sign(a, &cancel),
+        PgpCmd::Verify(a) => pgp_verify(a, &cancel),
     }
 }
 
@@ -524,6 +612,87 @@ fn pgp_decrypt(a: PgpDecryptArgs, cancel: &AtomicBool) -> ct::Result<()> {
     Ok(())
 }
 
+fn pgp_sign(a: PgpSignArgs, cancel: &AtomicBool) -> ct::Result<()> {
+    let output = a.output.clone().unwrap_or_else(|| {
+        default_output_ext(
+            &a.input,
+            if a.armor {
+                ct::PGP_SIGNATURE_ARMOR_EXTENSION
+            } else {
+                ct::PGP_SIGNATURE_EXTENSION
+            },
+        )
+    });
+    let passphrase = a.password.read(false)?;
+    let show = !a.quiet && io::stderr().is_terminal();
+    let mut on_progress = progress_cb(show);
+    let res = ct::pgp_sign_path(
+        &a.input,
+        &output,
+        &a.key,
+        passphrase,
+        a.armor,
+        a.force,
+        &mut on_progress,
+        cancel,
+    );
+    if show {
+        eprintln!();
+    }
+    res?;
+    if !a.quiet {
+        eprintln!("-> {}", output.display());
+    }
+    Ok(())
+}
+
+fn pgp_verify(a: PgpVerifyArgs, cancel: &AtomicBool) -> ct::Result<()> {
+    let signature = a.signature.clone().unwrap_or_else(|| {
+        default_signature_input(
+            &a.input,
+            ct::PGP_SIGNATURE_EXTENSION,
+            ct::PGP_SIGNATURE_ARMOR_EXTENSION,
+        )
+    });
+    let show = !a.quiet && io::stderr().is_terminal();
+    let mut on_progress = progress_cb(show);
+    let res = ct::pgp_verify_path(&a.input, &signature, &a.key, &mut on_progress, cancel);
+    if show {
+        eprintln!();
+    }
+    let report = res?;
+    print_verify_report(&report, a.quiet);
+    Ok(())
+}
+
+fn print_verify_report(report: &ct::VerifyReport, quiet: bool) {
+    if quiet {
+        return;
+    }
+    println!("Gültige Signatur");
+    println!("Unterzeichner : {}", report.signer);
+    println!("Schlüssel     : {}", report.key_id);
+    match report.created {
+        Some(secs) => println!("Zeitpunkt     : {secs} (Unix-Zeit)"),
+        None => println!("Zeitpunkt     : nicht angegeben"),
+    }
+}
+
+/// Sucht die Standard-Signaturdatei; bevorzugt die binäre Variante, fällt bei
+/// Bedarf auf die ASCII-Variante zurück.
+fn default_signature_input(input: &Path, binary_ext: &str, armor_ext: &str) -> PathBuf {
+    let binary = default_output_ext(input, binary_ext);
+    if binary.exists() {
+        return binary;
+    }
+    let armored = default_output_ext(input, armor_ext);
+    if armored.exists() {
+        armored
+    } else {
+        binary
+    }
+}
+
 /// Entschlüsselte PQC-Nachricht: "brief.pqc" -> "brief".
 fn pqc_default_output_decrypt(input: &Path) -> PathBuf {
     let mut name = match input.file_name().and_then(|n| n.to_str()) {
@@ -546,6 +715,8 @@ fn pqc_run(cmd: PqcCmd) -> ct::Result<()> {
         PqcCmd::Keygen(a) => pqc_keygen(a),
         PqcCmd::Encrypt(a) => pqc_encrypt(a, &cancel),
         PqcCmd::Decrypt(a) => pqc_decrypt(a, &cancel),
+        PqcCmd::Sign(a) => pqc_sign(a, &cancel),
+        PqcCmd::Verify(a) => pqc_verify(a, &cancel),
     }
 }
 
@@ -633,9 +804,61 @@ fn pqc_decrypt(a: PqcDecryptArgs, cancel: &AtomicBool) -> ct::Result<()> {
     Ok(())
 }
 
+fn pqc_sign(a: PqcSignArgs, cancel: &AtomicBool) -> ct::Result<()> {
+    let output = a.output.clone().unwrap_or_else(|| {
+        default_output_ext(
+            &a.input,
+            if a.armor {
+                ct::PQC_SIGNATURE_ARMOR_EXTENSION
+            } else {
+                ct::PQC_SIGNATURE_EXTENSION
+            },
+        )
+    });
+    let passphrase = a.password.read(false)?;
+    let show = !a.quiet && io::stderr().is_terminal();
+    let mut on_progress = progress_cb(show);
+    let res = ct::pqc_sign_path(
+        &a.input,
+        &output,
+        &a.key,
+        passphrase,
+        a.armor,
+        a.force,
+        &mut on_progress,
+        cancel,
+    );
+    if show {
+        eprintln!();
+    }
+    res?;
+    if !a.quiet {
+        eprintln!("-> {}", output.display());
+    }
+    Ok(())
+}
+
+fn pqc_verify(a: PqcVerifyArgs, cancel: &AtomicBool) -> ct::Result<()> {
+    let signature = a.signature.clone().unwrap_or_else(|| {
+        default_signature_input(
+            &a.input,
+            ct::PQC_SIGNATURE_EXTENSION,
+            ct::PQC_SIGNATURE_ARMOR_EXTENSION,
+        )
+    });
+    let show = !a.quiet && io::stderr().is_terminal();
+    let mut on_progress = progress_cb(show);
+    let res = ct::pqc_verify_path(&a.input, &signature, &a.key, &mut on_progress, cancel);
+    if show {
+        eprintln!();
+    }
+    let report = res?;
+    print_verify_report(&report, a.quiet);
+    Ok(())
+}
+
 /// Strg+C-Handler, der nur das Abbruch-Flag setzt.
-fn setup_cancel() -> Arc<AtomicBool> {
-    let cancel = Arc::new(AtomicBool::new(false));
+fn setup_cancel() -> Arc<AtomicBool> {    let cancel = Arc::new(AtomicBool::new(false));
     {
         let c = Arc::clone(&cancel);
         let _ = ctrlc::set_handler(move || c.store(true, Ordering::Relaxed));

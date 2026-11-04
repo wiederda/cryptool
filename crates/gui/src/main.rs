@@ -9,8 +9,9 @@ use std::thread;
 
 use cryptool_lib::{
     decrypt_path, encrypt_path, pgp_decrypt_path, pgp_decrypt_text, pgp_encrypt_path,
-    pgp_encrypt_text, pgp_generate_key, pqc_decrypt_path, pqc_decrypt_text, pqc_encrypt_path,
-    pqc_encrypt_text, pqc_generate_key, Progress, SecretString,
+    pgp_encrypt_text, pgp_generate_key, pgp_sign_path, pgp_verify_path, pqc_decrypt_path,
+    pqc_decrypt_text, pqc_encrypt_path, pqc_encrypt_text, pqc_generate_key, pqc_sign_path,
+    pqc_verify_path, Progress, SecretString, VerifyReport,
 };
 use eframe::egui;
 use zeroize::Zeroize;
@@ -29,6 +30,51 @@ enum Method {
     Ctx,
     Pgp,
     Pqc,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Encrypt,
+    Decrypt,
+    Sign,
+    Verify,
+}
+
+impl Op {
+    fn verb(self) -> &'static str {
+        match self {
+            Op::Encrypt => "verschlüsseln",
+            Op::Decrypt => "entschlüsseln",
+            Op::Sign => "signieren",
+            Op::Verify => "prüfen",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Op::Encrypt => "Verschlüsseln",
+            Op::Decrypt => "Entschlüsseln",
+            Op::Sign => "Signieren",
+            Op::Verify => "Signatur prüfen",
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Op::Encrypt => "Jetzt verschlüsseln",
+            Op::Decrypt => "Jetzt entschlüsseln",
+            Op::Sign => "Jetzt signieren",
+            Op::Verify => "Signatur prüfen",
+        }
+    }
+
+    fn is_text_allowed(self) -> bool {
+        matches!(self, Op::Encrypt | Op::Decrypt)
+    }
+
+    fn uses_secret_key(self) -> bool {
+        matches!(self, Op::Decrypt | Op::Sign)
+    }
 }
 
 impl Method {
@@ -56,6 +102,22 @@ impl Method {
         self.tag()
     }
 
+    fn signature_extension(self) -> &'static str {
+        match self {
+            Method::Ctx => "sig",
+            Method::Pgp => "sig",
+            Method::Pqc => "pqc.sig",
+        }
+    }
+
+    fn signature_armor_extension(self) -> &'static str {
+        match self {
+            Method::Ctx => "sig.asc",
+            Method::Pgp => "sig.asc",
+            Method::Pqc => "pqc.sig.asc",
+        }
+    }
+
     fn text_label(self) -> &'static str {
         match self {
             Method::Ctx => "Text",
@@ -77,11 +139,21 @@ struct RecipientKey {
     method: Method,
 }
 
+#[derive(Clone)]
+struct SecretKey {
+    label: String,
+    path: PathBuf,
+    method: Method,
+}
+
 struct CryptoolApp {
     input: Option<PathBuf>,
     key: Option<PathBuf>,
+    signature: Option<PathBuf>,
     recipients: Vec<RecipientKey>,
+    secret_keys: Vec<SecretKey>,
     recipient_label: String,
+    secret_label: String,
     method: Method,
     keygen: bool,
     text_mode: bool,
@@ -90,7 +162,7 @@ struct CryptoolApp {
     user_id: String,
     password: String,
     password_confirm: String,
-    encrypting: bool,
+    op: Op,
     running: bool,
     progress: Option<Progress>,
     status: String,
@@ -105,8 +177,11 @@ impl Default for CryptoolApp {
         Self {
             input: None,
             key: None,
+            signature: None,
             recipients: load_recipient_keys(),
+            secret_keys: load_secret_keys(),
             recipient_label: String::new(),
+            secret_label: String::new(),
             method: Method::Ctx,
             keygen: false,
             text_mode: false,
@@ -115,7 +190,7 @@ impl Default for CryptoolApp {
             user_id: String::new(),
             password: String::new(),
             password_confirm: String::new(),
-            encrypting: true,
+            op: Op::Encrypt,
             running: false,
             progress: None,
             status: "Datei oder Ordner auswählen".into(),
@@ -184,19 +259,112 @@ impl CryptoolApp {
         self.status = format!("Öffentlicher Schlüssel für {label} importiert.");
     }
 
-    fn set_mode(&mut self, encrypting: bool) {
-        if self.running || self.encrypting == encrypting {
+    fn import_secret_key(&mut self) {
+        let Some(source) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        let Some(method) = detect_key_method(&source) else {
+            self.status = "Die Datei ist kein bekannter Schlüssel.".into();
+            return;
+        };
+        if method != self.method {
+            self.status = format!(
+                "Die Datei enthält einen {}-Schlüssel, nicht {}. Bitte im passenden Verfahren öffnen.",
+                method.label(),
+                self.method.label()
+            );
             return;
         }
-        self.encrypting = encrypting;
+        let Ok(source_bytes) = fs::read(&source) else {
+            self.status = "Der geheime Schlüssel konnte nicht gelesen werden.".into();
+            return;
+        };
+        if let Some(existing) = self.secret_keys.iter().find(|entry| {
+            entry.method == method
+                && fs::read(&entry.path)
+                    .map(|bytes| bytes == source_bytes)
+                    .unwrap_or(false)
+        }) {
+            self.key = Some(existing.path.clone());
+            self.status = format!("Geheimer Schlüssel „{}“ ausgewählt.", existing.label);
+            return;
+        }
+        let Some(directory) = secret_key_dir() else {
+            self.status = "Der Speicherort für Schlüssel ist nicht verfügbar.".into();
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(&directory) {
+            self.status = format!("Schlüsselordner konnte nicht angelegt werden: {error}");
+            return;
+        }
+        let next_id = (1u64..)
+            .find(|id| !directory.join(format!("secret-{id}.key")).exists())
+            .unwrap_or(1);
+        let file_name = format!("secret-{next_id}.key");
+        let destination = directory.join(&file_name);
+        if let Err(error) = fs::write(&destination, &source_bytes) {
+            self.status = format!("Geheimer Schlüssel konnte nicht gespeichert werden: {error}");
+            return;
+        }
+        let entered_label = self.secret_label.trim().replace(['\t', '\r', '\n'], " ");
+        let label = if entered_label.is_empty() {
+            source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .unwrap_or("Geheimer Schlüssel")
+                .to_owned()
+        } else {
+            entered_label
+        };
+        let manifest = directory.join("secret-keys.tsv");
+        let mut contents = fs::read_to_string(&manifest).unwrap_or_default();
+        contents.push_str(&format!("{}\t{}\t{}\n", method.tag(), label, file_name));
+        if let Err(error) = fs::write(&manifest, contents) {
+            let _ = fs::remove_file(&destination);
+            self.status = format!("Schlüsselverwaltung konnte nicht gespeichert werden: {error}");
+            return;
+        }
+        self.secret_keys.push(SecretKey {
+            label: label.clone(),
+            path: destination.clone(),
+            method,
+        });
+        self.key = Some(destination);
+        self.secret_label.clear();
+        self.status = format!("Geheimer Schlüssel „{label}“ gemerkt.");
+    }
+
+    fn set_mode(&mut self, op: Op) {
+        if self.running || self.op == op {
+            return;
+        }
+        // Öffentliche und geheime Schlüssel sind nicht austauschbar. Beim
+        // Wechsel der Schlüsselrolle darf keine falsche Auswahl stehen bleiben.
+        if self.op.uses_secret_key() != op.uses_secret_key() {
+            self.key = None;
+        }
+        self.op = op;
+        if !op.is_text_allowed() {
+            self.text_mode = false;
+        }
         self.input = None;
+        self.signature = None;
         self.password.zeroize();
         self.password_confirm.zeroize();
         self.progress = None;
-        self.status = if encrypting {
-            "Datei oder Ordner auswählen".into()
-        } else {
-            format!("{}: Datei zum Entschlüsseln auswählen", self.method.label())
+        self.status = match op {
+            Op::Encrypt if self.method.key_based() && self.text_mode => "Text eingeben".into(),
+            Op::Encrypt => "Datei oder Ordner auswählen".into(),
+            Op::Decrypt if self.method.key_based() && self.text_mode => {
+                format!("{}: Text zum Entschlüsseln einfügen", self.method.label())
+            }
+            Op::Decrypt => format!("{}: Datei zum Entschlüsseln auswählen", self.method.label()),
+            Op::Sign => format!("{}: Datei zum Signieren auswählen", self.method.label()),
+            Op::Verify => format!(
+                "{}: Datei und Signatur zum Prüfen auswählen",
+                self.method.label()
+            ),
         };
     }
 
@@ -209,6 +377,10 @@ impl CryptoolApp {
         self.text_mode = false;
         self.input = None;
         self.key = None;
+        self.signature = None;
+        if method == Method::Ctx && !self.op.is_text_allowed() {
+            self.op = Op::Encrypt;
+        }
         self.password.zeroize();
         self.password_confirm.zeroize();
         self.progress = None;
@@ -290,6 +462,10 @@ impl CryptoolApp {
             self.status = "Bitte zuerst eine Eingabe auswählen.".into();
             return;
         };
+        if matches!(self.op, Op::Sign | Op::Verify) && input.is_dir() {
+            self.status = "Signieren und Prüfen wird nur für einzelne Dateien unterstützt.".into();
+            return;
+        }
         let key = if self.method.key_based() {
             match self.key.clone() {
                 Some(key) => Some(key),
@@ -301,11 +477,15 @@ impl CryptoolApp {
         } else {
             None
         };
-        if (!self.method.key_based() || !self.encrypting) && self.password.is_empty() {
-            self.status = "Bitte ein Passwort eingeben.".into();
+        let needs_password = !self.method.key_based() || self.op.uses_secret_key() || self.keygen;
+        if needs_password && self.password.is_empty() {
+            self.status = "Bitte ein Passwort bzw. eine Passphrase eingeben.".into();
             return;
         }
-        if !self.method.key_based() && self.encrypting && self.password != self.password_confirm {
+        if self.method == Method::Ctx
+            && self.op == Op::Encrypt
+            && self.password != self.password_confirm
+        {
             self.status = "Die Passwörter stimmen nicht überein.".into();
             return;
         }
@@ -314,9 +494,18 @@ impl CryptoolApp {
         self.password_confirm.zeroize();
         let secret = SecretString::new(std::mem::take(&mut password));
         password.zeroize();
-        let encrypting = self.encrypting;
+        let op = self.op;
         let method = self.method;
-        let output = default_output(&input, encrypting, method);
+        let output = default_output(&input, op, method);
+        let signature = if op == Op::Verify {
+            Some(
+                self.signature
+                    .clone()
+                    .unwrap_or_else(|| default_signature(&input, method)),
+            )
+        } else {
+            None
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -330,9 +519,10 @@ impl CryptoolApp {
             run_operation(
                 input,
                 output,
+                signature,
                 key,
                 secret,
-                encrypting,
+                op,
                 method,
                 worker_cancel,
                 tx,
@@ -349,11 +539,13 @@ impl CryptoolApp {
             self.status = "Bitte Text eingeben.".into();
             return;
         }
-        if !self.encrypting && self.password.is_empty() {
+        if self.op == Op::Decrypt && self.password.is_empty() {
             self.status = "Bitte die Passphrase des geheimen Schlüssels eingeben.".into();
             return;
         }
-        let input = std::mem::take(&mut self.text_input);
+        // Eingabe stehen lassen, damit Klartext bzw. verschlüsselter Text beim
+        // erneuten Ausführen nicht verloren geht.
+        let input = self.text_input.clone();
         let passphrase = SecretString::new(std::mem::take(&mut self.password));
         self.password_confirm.zeroize();
         self.running = true;
@@ -361,19 +553,19 @@ impl CryptoolApp {
         self.text_output.clear();
         let (tx, rx) = mpsc::channel();
         self.events = Some(rx);
-        let encrypting = self.encrypting;
+        let decrypting = self.op == Op::Decrypt;
         let method = self.method;
         thread::spawn(move || {
             let result = match method {
                 Method::Pgp => {
-                    if encrypting {
+                    if !decrypting {
                         pgp_encrypt_text(&input, &key)
                     } else {
                         pgp_decrypt_text(&input, &key, passphrase)
                     }
                 }
                 Method::Pqc => {
-                    if encrypting {
+                    if !decrypting {
                         pqc_encrypt_text(&input, &key)
                     } else {
                         pqc_decrypt_text(&input, &key, passphrase)
@@ -421,32 +613,13 @@ impl CryptoolApp {
         if self.method.key_based() && self.keygen {
             format!("{name} · Schlüsselpaar erstellen")
         } else if self.method.key_based() && self.text_mode {
-            format!(
-                "{name} · Text {}",
-                if self.encrypting {
-                    "verschlüsseln"
-                } else {
-                    "entschlüsseln"
-                }
-            )
+            format!("{name} · Text {}", self.op.verb())
         } else if self.method == Method::Ctx {
-            format!(
-                "CTX · {}",
-                if self.encrypting {
-                    "Verschlüsseln"
-                } else {
-                    "Entschlüsseln"
-                }
-            )
+            format!("CTX · {}", self.op.title())
+        } else if self.op == Op::Verify {
+            format!("{name} · Signatur prüfen")
         } else {
-            format!(
-                "{name} · Datei {}",
-                if self.encrypting {
-                    "verschlüsseln"
-                } else {
-                    "entschlüsseln"
-                }
-            )
+            format!("{name} · Datei {}", self.op.verb())
         }
     }
 
@@ -455,16 +628,22 @@ impl CryptoolApp {
             format!("{}-Schlüsselpaar erzeugen.", self.method.label())
         } else if self.method.key_based() && self.text_mode {
             "Text verschlüsseln oder entschlüsseln.".to_owned()
-        } else if self.encrypting {
-            "Datei oder Ordner auswählen und verschlüsseln.".to_owned()
         } else {
-            "Datei oder Ordner auswählen und entschlüsseln.".to_owned()
+            match self.op {
+                Op::Encrypt => "Datei oder Ordner auswählen und verschlüsseln.".to_owned(),
+                Op::Decrypt => "Datei oder Ordner auswählen und entschlüsseln.".to_owned(),
+                Op::Sign => "Einzelne Datei auswählen und abgetrennt signieren.".to_owned(),
+                Op::Verify => "Datei und Signatur auswählen und prüfen.".to_owned(),
+            }
         }
     }
 
     fn start_ribbon(&mut self, ui: &mut egui::Ui) {
         ribbon_group(ui, "Eingabe", |ui| {
-            let text_active = self.method.key_based() && self.text_mode && !self.keygen;
+            let text_active = self.method.key_based()
+                && self.text_mode
+                && !self.keygen
+                && self.op.is_text_allowed();
             if ribbon_button(
                 ui,
                 RibbonIcon::File,
@@ -476,9 +655,10 @@ impl CryptoolApp {
             {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     self.input = Some(path);
+                    self.signature = None;
                 }
             }
-            let folder_available = !self.running && !text_active && self.encrypting;
+            let folder_available = !self.running && !text_active && self.op == Op::Encrypt;
             if ribbon_button(
                 ui,
                 RibbonIcon::Folder,
@@ -490,6 +670,7 @@ impl CryptoolApp {
             {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.input = Some(path);
+                    self.signature = None;
                 }
             }
         });
@@ -500,23 +681,45 @@ impl CryptoolApp {
                 ui,
                 RibbonIcon::Lock,
                 "Verschlüsseln",
-                self.encrypting,
+                self.op == Op::Encrypt,
                 available,
             )
             .clicked()
             {
-                self.set_mode(true);
+                self.set_mode(Op::Encrypt);
             }
             if ribbon_button(
                 ui,
                 RibbonIcon::Unlock,
                 "Entschlüsseln",
-                !self.encrypting,
+                self.op == Op::Decrypt,
                 available,
             )
             .clicked()
             {
-                self.set_mode(false);
+                self.set_mode(Op::Decrypt);
+            }
+            if ribbon_button(
+                ui,
+                RibbonIcon::Signature,
+                "Signieren",
+                self.op == Op::Sign,
+                available && self.method.key_based(),
+            )
+            .clicked()
+            {
+                self.set_mode(Op::Sign);
+            }
+            if ribbon_button(
+                ui,
+                RibbonIcon::Check,
+                "Prüfen",
+                self.op == Op::Verify,
+                available && self.method.key_based(),
+            )
+            .clicked()
+            {
+                self.set_mode(Op::Verify);
             }
         });
         ribbon_separator(ui);
@@ -557,10 +760,19 @@ impl CryptoolApp {
         });
         ribbon_separator(ui);
         ribbon_group(ui, "Ansicht", |ui| {
-            let text_available = self.method.key_based() && !self.keygen && !self.running;
+            let text_available = self.method.key_based()
+                && !self.keygen
+                && !self.running
+                && self.op.is_text_allowed();
             if ribbon_button(ui, RibbonIcon::Text, "Text", self.text_mode, text_available).clicked()
             {
                 self.text_mode = true;
+                self.status = match self.op {
+                    Op::Decrypt => {
+                        format!("{}: Text zum Entschlüsseln einfügen", self.method.label())
+                    }
+                    _ => "Text eingeben".into(),
+                };
             }
             if ribbon_button(
                 ui,
@@ -572,6 +784,12 @@ impl CryptoolApp {
             .clicked()
             {
                 self.text_mode = false;
+                self.status = match self.op {
+                    Op::Decrypt => {
+                        format!("{}: Datei zum Entschlüsseln auswählen", self.method.label())
+                    }
+                    _ => "Datei oder Ordner auswählen".into(),
+                };
             }
         });
     }
@@ -598,27 +816,9 @@ impl CryptoolApp {
         });
         ribbon_separator(ui);
         ribbon_group(ui, "Geheimer Schlüssel", |ui| {
-            let available = self.method.key_based() && !self.encrypting && !self.running;
+            let available = self.method.key_based() && self.op.uses_secret_key() && !self.running;
             if ribbon_button(ui, RibbonIcon::KeyOpen, "Öffnen", false, available).clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    match detect_key_method(&path) {
-                        Some(method) if method == self.method => {
-                            self.key = Some(path);
-                            self.status =
-                                format!("{}: geheimer Schlüssel ausgewählt.", self.method.label());
-                        }
-                        Some(method) => {
-                            self.status = format!(
-                                "Die Datei enthält einen {}-Schlüssel, nicht {}.",
-                                method.label(),
-                                self.method.label()
-                            );
-                        }
-                        None => {
-                            self.status = "Die Datei ist kein bekannter Schlüssel.".into();
-                        }
-                    }
-                }
+                self.import_secret_key();
             }
         });
     }
@@ -778,9 +978,14 @@ impl eframe::App for CryptoolApp {
 
                                         if self.method.key_based() && !self.keygen {
                                             ui.add_space(12.0);
-                                            if self.encrypting {
+                                            if !self.op.uses_secret_key() {
                                                 ui.label(format!(
-                                                    "Empfängerschlüssel ({})",
+                                                    "{} ({})",
+                                                    if self.op == Op::Verify {
+                                                        "Öffentlicher Schlüssel des Unterzeichners"
+                                                    } else {
+                                                        "Empfängerschlüssel"
+                                                    },
                                                     self.method.label()
                                                 ));
                                                 if !self.recipients.is_empty() {
@@ -853,18 +1058,106 @@ impl eframe::App for CryptoolApp {
                                                     ui.small(path.display().to_string());
                                                 }
                                             } else {
-                                                ui.label("Geheimer Schlüssel");
-                                                ui.label(self.key.as_deref().map_or(
-                                                    "Kein Schlüssel ausgewählt – im Menüband unter „Schlüssel“ öffnen"
-                                                        .to_owned(),
-                                                    |path| path.display().to_string(),
-                                                ));
+                                                ui.label(match self.op {
+                                                    Op::Sign => {
+                                                        "Signaturschlüssel (geheimer Schlüssel)"
+                                                    }
+                                                    Op::Decrypt => {
+                                                        "Entschlüsselungsschlüssel (geheimer Schlüssel)"
+                                                    }
+                                                    _ => "Geheimer Schlüssel",
+                                                });
+                                                let candidates: Vec<SecretKey> = self
+                                                    .secret_keys
+                                                    .iter()
+                                                    .filter(|entry| entry.method == self.method)
+                                                    .cloned()
+                                                    .collect();
+                                                if candidates.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "Noch kein {}-Schlüssel importiert.",
+                                                            self.method.label()
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(egui::Color32::from_rgb(
+                                                            105, 117, 130,
+                                                        )),
+                                                    );
+                                                } else {
+                                                    let selected = self
+                                                        .key
+                                                        .as_ref()
+                                                        .and_then(|path| {
+                                                            candidates
+                                                                .iter()
+                                                                .find(|entry| &entry.path == path)
+                                                        })
+                                                        .map_or(
+                                                            "Schlüssel auswählen",
+                                                            |entry| entry.label.as_str(),
+                                                        );
+                                                    egui::ComboBox::from_id_salt("secret_keys")
+                                                        .selected_text(selected)
+                                                        .show_ui(ui, |ui| {
+                                                            for entry in &candidates {
+                                                                if ui
+                                                                    .selectable_label(
+                                                                        self.key.as_ref()
+                                                                            == Some(&entry.path),
+                                                                        &entry.label,
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    self.key = Some(
+                                                                        entry.path.clone(),
+                                                                    );
+                                                                }
+                                                            }
+                                                        });
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut self.secret_label,
+                                                        )
+                                                        .hint_text("Name, z. B. Anna oder Team"),
+                                                    );
+                                                    if ui.button("Importieren").clicked() {
+                                                        self.import_secret_key();
+                                                    }
+                                                });
+                                                if let Some(path) = &self.key {
+                                                    ui.small(path.display().to_string());
+                                                }
+                                            }
+                                            if self.op == Op::Verify {
+                                                ui.add_space(10.0);
+                                                ui.label("Signaturdatei");
+                                                let shown = self.signature.clone().or_else(|| {
+                                                    self.input
+                                                        .as_deref()
+                                                        .map(|input| default_signature(input, self.method))
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.small(shown.map_or(
+                                                        "Wird aus der Eingabedatei abgeleitet".to_owned(),
+                                                        |path| path.display().to_string(),
+                                                    ));
+                                                    if ui.button("Wählen").clicked() {
+                                                        if let Some(path) =
+                                                            rfd::FileDialog::new().pick_file()
+                                                        {
+                                                            self.signature = Some(path);
+                                                        }
+                                                    }
+                                                });
                                             }
                                         }
 
                                         if self.method.key_based() && self.text_mode && !self.keygen {
                                             ui.add_space(20.0);
-                                            ui.label(if self.encrypting {
+                                            ui.label(if self.op == Op::Encrypt {
                                                 "Klartext"
                                             } else {
                                                 self.method.text_label()
@@ -876,7 +1169,7 @@ impl eframe::App for CryptoolApp {
                                             );
                                             if !self.text_output.is_empty() {
                                                 ui.add_space(10.0);
-                                                ui.label(if self.encrypting {
+                                                ui.label(if self.op == Op::Encrypt {
                                                     "Verschlüsselter Text"
                                                 } else {
                                                     "Entschlüsselter Text"
@@ -933,7 +1226,10 @@ impl eframe::App for CryptoolApp {
                                         }
 
                                         ui.add_space(18.0);
-                                        if !self.method.key_based() || !self.encrypting || self.keygen {
+                                        let needs_password = !self.method.key_based()
+                                            || self.op.uses_secret_key()
+                                            || self.keygen;
+                                        if needs_password {
                                             ui.label(
                                                 egui::RichText::new("PASSWORT")
                                                     .size(11.0)
@@ -946,12 +1242,15 @@ impl eframe::App for CryptoolApp {
                                                     .password(true)
                                                     .hint_text(if self.keygen {
                                                         "Passphrase für den geheimen Schlüssel"
+                                                    } else if self.op.uses_secret_key() {
+                                                        "Passphrase des geheimen Schlüssels"
                                                     } else {
                                                         "Passwort eingeben"
                                                     })
                                                     .desired_width(f32::INFINITY),
                                             );
-                                            if (!self.method.key_based() && self.encrypting)
+                                            if (self.method == Method::Ctx
+                                                && self.op == Op::Encrypt)
                                                 || (self.method.key_based() && self.keygen)
                                             {
                                                 ui.add_space(7.0);
@@ -1012,10 +1311,8 @@ impl eframe::App for CryptoolApp {
                                         } else {
                                             let action = if self.method.key_based() && self.keygen {
                                                 "Schlüsselpaar erstellen"
-                                            } else if self.encrypting {
-                                                "Jetzt verschlüsseln"
                                             } else {
-                                                "Jetzt entschlüsseln"
+                                                self.op.action()
                                             };
                                             if ui
                                                 .add_sized(
@@ -1050,8 +1347,12 @@ impl eframe::App for CryptoolApp {
                         ui.label(
                             egui::RichText::new(match self.method {
                                 Method::Ctx => "CTX · Argon2id · XChaCha20-Poly1305",
-                                Method::Pgp => "OpenPGP · Ed25519 · X25519 · AES-256/OCB",
-                                Method::Pqc => "PQC · ML-KEM-768 · HKDF-SHA256 · XChaCha20-Poly1305",
+                                Method::Pgp => {
+                                    "OpenPGP · Ed25519 (Signatur) · X25519 · AES-256/OCB"
+                                }
+                                Method::Pqc => {
+                                    "PQC · ML-KEM-768 · ML-DSA-65 · HKDF-SHA256 · XChaCha20-Poly1305"
+                                }
                             })
                             .size(11.0)
                             .color(egui::Color32::from_rgb(104, 116, 130)),
@@ -1072,8 +1373,8 @@ impl eframe::App for CryptoolApp {
                     ui.label("Lokale Ver- und Entschlüsselung von Dateien und Text.");
                     ui.add_space(8.0);
                     ui.label("CTX · Argon2id · XChaCha20-Poly1305");
-                    ui.label("OpenPGP · Ed25519 · X25519 · AES-256/OCB");
-                    ui.label("PQC · ML-KEM-768 · HKDF-SHA256 · XChaCha20-Poly1305");
+                    ui.label("OpenPGP · Ed25519 (Signatur) · X25519 · AES-256/OCB");
+                    ui.label("PQC · ML-KEM-768 · ML-DSA-65 · HKDF-SHA256 · XChaCha20-Poly1305");
                     ui.add_space(10.0);
                     if ui.button("Schließen").clicked() {
                         close = true;
@@ -1214,6 +1515,8 @@ enum RibbonIcon {
     Text,
     Mail,
     Shield,
+    Signature,
+    Check,
     Help,
 }
 
@@ -1329,6 +1632,23 @@ fn draw_icon(painter: &egui::Painter, center: egui::Pos2, icon: RibbonIcon, colo
             ]);
             line(&[p(6.5, 8.0), p(9.0, 10.5), p(12.0, 6.0)]);
         }
+        RibbonIcon::Signature => {
+            // Stift über einer Linie: abgetrennte Signatur.
+            line(&[p(3.5, 15.5), p(14.5, 15.5)]);
+            line(&[
+                p(4.0, 12.5),
+                p(5.0, 8.5),
+                p(12.5, 1.5),
+                p(15.5, 4.5),
+                p(8.0, 11.5),
+                p(4.0, 12.5),
+            ]);
+            line(&[p(5.0, 8.5), p(8.0, 11.5)]);
+        }
+        RibbonIcon::Check => {
+            painter.circle_stroke(p(9.0, 9.0), 6.5, stroke);
+            line(&[p(5.5, 9.5), p(8.0, 12.0), p(12.5, 6.5)]);
+        }
         RibbonIcon::Help => {
             painter.circle_stroke(p(9.0, 9.0), 6.5, stroke);
             painter.text(
@@ -1384,6 +1704,10 @@ fn recipient_key_dir() -> Option<PathBuf> {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").into_os_string())
     });
     root.map(|path| PathBuf::from(path).join("cryptool").join("recipient-keys"))
+}
+
+fn secret_key_dir() -> Option<PathBuf> {
+    recipient_key_dir().map(|path| path.with_file_name("secret-keys"))
 }
 
 fn method_from_tag(tag: &str) -> Option<Method> {
@@ -1473,12 +1797,46 @@ fn load_recipient_keys() -> Vec<RecipientKey> {
     recipients
 }
 
+fn load_secret_keys() -> Vec<SecretKey> {
+    let Some(directory) = secret_key_dir() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(directory.join("secret-keys.tsv")) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for line in contents.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        let [tag, label, file_name] = parts.as_slice() else {
+            continue;
+        };
+        let Some(method) = method_from_tag(tag) else {
+            continue;
+        };
+        let file_name = PathBuf::from(file_name);
+        if file_name.components().count() != 1 {
+            continue;
+        }
+        let path = directory.join(file_name);
+        if !path.is_file() {
+            continue;
+        }
+        keys.push(SecretKey {
+            label: (*label).to_owned(),
+            path,
+            method,
+        });
+    }
+    keys
+}
+
 fn run_operation(
     input: PathBuf,
     output: PathBuf,
+    signature: Option<PathBuf>,
     key: Option<PathBuf>,
     password: SecretString,
-    encrypting: bool,
+    op: Op,
     method: Method,
     cancel: Arc<AtomicBool>,
     events: Sender<Event>,
@@ -1486,86 +1844,162 @@ fn run_operation(
     let mut on_progress = |progress| {
         let _ = events.send(Event::Progress(progress));
     };
-    let result = match method {
-        Method::Ctx => {
-            if encrypting {
-                encrypt_path(&input, &output, password, false, &mut on_progress, &cancel)
-                    .map(|_| ())
-            } else {
-                decrypt_path(&input, &output, password, false, &mut on_progress, &cancel)
-            }
+    let result = match (method, op) {
+        (Method::Ctx, Op::Encrypt) => {
+            encrypt_path(&input, &output, password, false, &mut on_progress, &cancel)
+                .map(|_| format!("Fertig: {}", output.display()))
         }
-        Method::Pgp => {
+        (Method::Ctx, Op::Decrypt) => {
+            decrypt_path(&input, &output, password, false, &mut on_progress, &cancel)
+                .map(|_| format!("Fertig: {}", output.display()))
+        }
+        (Method::Ctx, Op::Sign | Op::Verify) => unreachable!("CTX unterstützt keine Signaturen"),
+        (Method::Pgp, Op::Encrypt) => {
             let key = key.expect("OpenPGP-Operation benötigt einen Schlüssel");
-            if encrypting {
-                pgp_encrypt_path(
-                    &input,
-                    &output,
-                    &key,
-                    false,
-                    false,
-                    &mut on_progress,
-                    &cancel,
-                )
-                .map(|_| ())
-            } else {
-                pgp_decrypt_path(
-                    &input,
-                    &output,
-                    &key,
-                    password,
-                    false,
-                    &mut on_progress,
-                    &cancel,
-                )
-            }
+            pgp_encrypt_path(
+                &input,
+                &output,
+                &key,
+                false,
+                false,
+                &mut on_progress,
+                &cancel,
+            )
+            .map(|_| format!("Fertig: {}", output.display()))
         }
-        Method::Pqc => {
+        (Method::Pgp, Op::Decrypt) => {
+            let key = key.expect("OpenPGP-Operation benötigt einen Schlüssel");
+            pgp_decrypt_path(
+                &input,
+                &output,
+                &key,
+                password,
+                false,
+                &mut on_progress,
+                &cancel,
+            )
+            .map(|_| format!("Fertig: {}", output.display()))
+        }
+        (Method::Pgp, Op::Sign) => {
+            let key = key.expect("OpenPGP-Operation benötigt einen Schlüssel");
+            pgp_sign_path(
+                &input,
+                &output,
+                &key,
+                password,
+                false,
+                false,
+                &mut on_progress,
+                &cancel,
+            )
+            .map(|_| format!("Signiert: {}", output.display()))
+        }
+        (Method::Pgp, Op::Verify) => {
+            let key = key.expect("OpenPGP-Operation benötigt einen Schlüssel");
+            let signature = signature.expect("Signaturprüfung benötigt eine Signaturdatei");
+            pgp_verify_path(&input, &signature, &key, &mut on_progress, &cancel)
+                .map(|report| verify_message(&report))
+        }
+        (Method::Pqc, Op::Encrypt) => {
             let key = key.expect("PQC-Operation benötigt einen Schlüssel");
-            if encrypting {
-                pqc_encrypt_path(&input, &output, &key, false, &mut on_progress, &cancel)
-                    .map(|_| ())
-            } else {
-                pqc_decrypt_path(
-                    &input,
-                    &output,
-                    &key,
-                    password,
-                    false,
-                    &mut on_progress,
-                    &cancel,
-                )
-            }
+            pqc_encrypt_path(&input, &output, &key, false, &mut on_progress, &cancel)
+                .map(|_| format!("Fertig: {}", output.display()))
+        }
+        (Method::Pqc, Op::Decrypt) => {
+            let key = key.expect("PQC-Operation benötigt einen Schlüssel");
+            pqc_decrypt_path(
+                &input,
+                &output,
+                &key,
+                password,
+                false,
+                &mut on_progress,
+                &cancel,
+            )
+            .map(|_| format!("Fertig: {}", output.display()))
+        }
+        (Method::Pqc, Op::Sign) => {
+            let key = key.expect("PQC-Operation benötigt einen Schlüssel");
+            pqc_sign_path(
+                &input,
+                &output,
+                &key,
+                password,
+                false,
+                false,
+                &mut on_progress,
+                &cancel,
+            )
+            .map(|_| format!("Signiert: {}", output.display()))
+        }
+        (Method::Pqc, Op::Verify) => {
+            let key = key.expect("PQC-Operation benötigt einen Schlüssel");
+            let signature = signature.expect("Signaturprüfung benötigt eine Signaturdatei");
+            pqc_verify_path(&input, &signature, &key, &mut on_progress, &cancel)
+                .map(|report| verify_message(&report))
         }
     };
-    let message = result
-        .map(|()| format!("Fertig: {}", output.display()))
-        .map_err(|error| error.to_string());
+    let message = result.map_err(|error| error.to_string());
     let _ = events.send(Event::Finished(message));
 }
 
-fn default_output(input: &std::path::Path, encrypting: bool, method: Method) -> PathBuf {
-    if encrypting {
-        let mut name = input.as_os_str().to_owned();
-        name.push(format!(".{}", method.extension()));
-        PathBuf::from(name)
-    } else {
-        let name = input.file_name().unwrap_or_default().to_os_string();
-        let text = name.to_string_lossy();
-        let suffix = format!(".{}", method.extension());
-        let base = text
-            .strip_suffix(&suffix)
-            .or_else(|| text.strip_suffix(&format!(".{}.asc", method.extension())))
-            .unwrap_or(&text);
-        if base.ends_with(".tar.zst") {
-            input.with_file_name(base.trim_end_matches(".tar.zst"))
-        } else if base == text {
-            let mut name = input.as_os_str().to_owned();
-            name.push(".dec");
-            PathBuf::from(name)
-        } else {
-            input.with_file_name(base)
+fn verify_message(report: &VerifyReport) -> String {
+    match report.created {
+        Some(seconds) => format!(
+            "Signatur gültig. Unterzeichner: {} · Schlüssel: {} · Zeitpunkt: {seconds} (Unix-Zeit)",
+            report.signer, report.key_id
+        ),
+        None => format!(
+            "Signatur gültig. Unterzeichner: {} · Schlüssel: {}",
+            report.signer, report.key_id
+        ),
+    }
+}
+
+fn append_extension(input: &Path, extension: &str) -> PathBuf {
+    let mut name = input.as_os_str().to_owned();
+    name.push(format!(".{extension}"));
+    PathBuf::from(name)
+}
+
+fn default_output(input: &Path, op: Op, method: Method) -> PathBuf {
+    match op {
+        Op::Encrypt => append_extension(input, method.extension()),
+        Op::Sign => append_extension(input, method.signature_extension()),
+        Op::Verify => default_signature(input, method),
+        Op::Decrypt => {
+            let name = input.file_name().unwrap_or_default().to_os_string();
+            let text = name.to_string_lossy();
+            let suffix = format!(".{}", method.extension());
+            let base = text
+                .strip_suffix(&suffix)
+                .or_else(|| text.strip_suffix(&format!(".{}.asc", method.extension())))
+                .unwrap_or(&text);
+            if base.ends_with(".tar.zst") {
+                input.with_file_name(base.trim_end_matches(".tar.zst"))
+            } else if base == text {
+                let mut name = input.as_os_str().to_owned();
+                name.push(".dec");
+                PathBuf::from(name)
+            } else {
+                input.with_file_name(base)
+            }
         }
+    }
+}
+
+/// Sucht die Standard-Signaturdatei; bevorzugt die binäre Variante und fällt
+/// bei Bedarf auf ASCII-Armor zurück.
+fn default_signature(input: &Path, method: Method) -> PathBuf {
+    let binary = append_extension(input, method.signature_extension());
+    if binary.exists() {
+        return binary;
+    }
+    let armored = append_extension(input, method.signature_armor_extension());
+    if armored.exists() {
+        armored
+    } else {
+        binary
     }
 }
 
