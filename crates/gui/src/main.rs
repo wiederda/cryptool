@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -132,6 +133,22 @@ enum Event {
     Finished(Result<String, String>),
 }
 
+enum KeyserverEvent {
+    Listed(Result<Vec<KeyserverEntry>, String>),
+    Downloaded {
+        label: String,
+        result: Result<Vec<u8>, String>,
+    },
+    Uploaded(Result<String, String>),
+}
+
+#[derive(Clone)]
+struct KeyserverEntry {
+    id: u64,
+    owner: String,
+    filename: String,
+}
+
 #[derive(Clone)]
 struct RecipientKey {
     label: String,
@@ -170,6 +187,15 @@ struct CryptoolApp {
     events: Option<Receiver<Event>>,
     ribbon_tab: RibbonTab,
     show_about: bool,
+    show_keyserver: bool,
+    keyserver_url: String,
+    keyserver_entries: Vec<KeyserverEntry>,
+    keyserver_selected: Option<usize>,
+    keyserver_status: String,
+    keyserver_loading: bool,
+    keyserver_events: Option<Receiver<KeyserverEvent>>,
+    keyserver_upload_path: Option<PathBuf>,
+    keyserver_owner: String,
 }
 
 impl Default for CryptoolApp {
@@ -198,6 +224,15 @@ impl Default for CryptoolApp {
             events: None,
             ribbon_tab: RibbonTab::Start,
             show_about: false,
+            show_keyserver: false,
+            keyserver_url: load_keyserver_url(),
+            keyserver_entries: Vec::new(),
+            keyserver_selected: None,
+            keyserver_status: String::new(),
+            keyserver_loading: false,
+            keyserver_events: None,
+            keyserver_upload_path: None,
+            keyserver_owner: String::new(),
         }
     }
 }
@@ -224,30 +259,200 @@ impl CryptoolApp {
             );
             return;
         }
-        let Some(directory) = recipient_key_dir() else {
-            self.status = "Der Speicherort für Schlüssel ist nicht verfügbar.".into();
+        let Ok(bytes) = fs::read(&source) else {
+            self.status = "Die Schlüsseldatei konnte nicht gelesen werden.".into();
             return;
         };
-        if let Err(error) = fs::create_dir_all(&directory) {
-            self.status = format!("Schlüsselordner konnte nicht angelegt werden: {error}");
-            return;
+        match self.store_recipient_key(&label, &bytes, method) {
+            Ok(()) => {
+                self.recipient_label.clear();
+                self.status = format!("Öffentlicher Schlüssel für {label} importiert.");
+            }
+            Err(error) => self.status = error,
         }
+    }
+
+    fn upload_to_keyserver(&mut self) {
+    if self.keyserver_loading {
+        return;
+    }
+
+    let owner = self.keyserver_owner.trim().to_owned();
+
+    if owner.is_empty() || owner.contains(['\r', '\n']) {
+        self.keyserver_status = "Bitte eine gültige Kennung eingeben.".into();
+        return;
+    }
+
+    let Some(path) = self.keyserver_upload_path.clone() else {
+        self.keyserver_status = "Bitte eine öffentliche Schlüsseldatei auswählen.".into();
+        return;
+    };
+
+    let base = normalize_keyserver_url(&self.keyserver_url);
+
+    if base.is_empty() {
+        self.keyserver_status = "Bitte die Keyserver-Adresse eingeben.".into();
+        return;
+    }
+
+    self.keyserver_loading = true;
+    self.keyserver_status = "Übertrage öffentlichen Schlüssel …".into();
+
+    let (tx, rx) = mpsc::channel();
+    self.keyserver_events = Some(rx);
+
+    thread::spawn(move || {
+        let result = Self::upload_keyserver_key(&base, &owner, &path);
+        let _ = tx.send(KeyserverEvent::Uploaded(result));
+    });
+}
+
+fn upload_keyserver_key(
+    base: &str,
+    owner: &str,
+    path: &Path,
+) -> Result<String, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("Datei konnte nicht gelesen werden: {e}"))?;
+
+    if metadata.len() == 0 || metadata.len() > KEYSERVER_MAX_BYTES {
+        return Err("Die Schlüsseldatei ist leer oder größer als 4 MB.".into());
+    }
+
+    let bytes = fs::read(path)
+        .map_err(|e| format!("Schlüsseldatei konnte nicht gelesen werden: {e}"))?;
+
+    if detect_key_method_bytes(&bytes) != Some(Method::Pgp) {
+        return Err("Die Datei enthält keinen gültigen OpenPGP-Schlüssel.".into());
+    }
+
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("public-key.asc")
+        .replace(['"', '\r', '\n'], "_");
+
+    let boundary = format!(
+        "----cryptool-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
+    let mut body = Vec::new();
+
+    // Kennung
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"owner\"\r\n\r\n\
+             {owner}\r\n"
+        )
+        .as_bytes(),
+    );
+
+    // Schlüsseldatei
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"pgpfile\"; filename=\"{filename}\"\r\n\
+             Content-Type: application/pgp-keys\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let url = format!("{base}/submit");
+
+    let response = ureq::post(&url)
+        .timeout(KEYSERVER_TIMEOUT)
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .set("Accept", "application/json")
+        .send_bytes(&body)
+        .map_err(|error| {
+            match error {
+                ureq::Error::Status(code, response) => {
+                    let mut message = String::new();
+
+                    let _ = response
+                        .into_reader()
+                        .take(64 * 1024)
+                        .read_to_string(&mut message);
+
+                    if message.trim().is_empty() {
+                        format!("Keyserver meldet HTTP {code}.")
+                    } else {
+                        format!("Keyserver meldet HTTP {code}: {}", message.trim())
+                    }
+                }
+                ureq::Error::Transport(error) => {
+                    format!("Keyserver nicht erreichbar: {error}")
+                }
+            }
+        })?;
+
+    let mut response_body = String::new();
+
+    response
+        .into_reader()
+        .take(64 * 1024)
+        .read_to_string(&mut response_body)
+        .map_err(|e| format!("Serverantwort konnte nicht gelesen werden: {e}"))?;
+
+    Ok(format!(
+        "Öffentlicher Schlüssel für {owner} erfolgreich hochgeladen."
+    ))
+}
+
+    /// Legt einen öffentlichen Schlüssel im Benutzerordner ab und trägt ihn in
+    /// die Schlüsselverwaltung ein.
+    fn store_recipient_key(
+        &mut self,
+        label: &str,
+        bytes: &[u8],
+        method: Method,
+    ) -> Result<(), String> {
+        let label = label.replace(['\t', '\r', '\n'], " ").trim().to_owned();
+        if label.is_empty() {
+            return Err("Bitte einen Namen für den Schlüssel angeben.".into());
+        }
+        if let Some(existing) = self.recipients.iter().find(|entry| {
+            entry.method == method
+                && fs::read(&entry.path)
+                    .map(|existing| existing == bytes)
+                    .unwrap_or(false)
+        }) {
+            self.key = Some(existing.path.clone());
+            return Ok(());
+        }
+        let Some(directory) = recipient_key_dir() else {
+            return Err("Der Speicherort für Schlüssel ist nicht verfügbar.".into());
+        };
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("Schlüsselordner konnte nicht angelegt werden: {error}"))?;
         let next_id = (1u64..)
             .find(|id| !directory.join(format!("recipient-{id}.key")).exists())
             .unwrap_or(1);
         let file_name = format!("recipient-{next_id}.key");
         let destination = directory.join(&file_name);
-        if let Err(error) = fs::copy(&source, &destination) {
-            self.status = format!("Schlüssel konnte nicht importiert werden: {error}");
-            return;
-        }
+        fs::write(&destination, bytes)
+            .map_err(|error| format!("Schlüssel konnte nicht importiert werden: {error}"))?;
         let manifest = directory.join("recipients.tsv");
         let mut contents = fs::read_to_string(&manifest).unwrap_or_default();
         contents.push_str(&format!("{}\t{}\t{}\n", method.tag(), label, file_name));
         if let Err(error) = fs::write(&manifest, contents) {
             let _ = fs::remove_file(&destination);
-            self.status = format!("Schlüsselverwaltung konnte nicht gespeichert werden: {error}");
-            return;
+            return Err(format!(
+                "Schlüsselverwaltung konnte nicht gespeichert werden: {error}"
+            ));
         }
         self.recipients.push(RecipientKey {
             label: label.clone(),
@@ -255,8 +460,153 @@ impl CryptoolApp {
             method,
         });
         self.key = Some(destination);
-        self.recipient_label.clear();
-        self.status = format!("Öffentlicher Schlüssel für {label} importiert.");
+        Ok(())
+    }
+
+    fn open_keyserver(&mut self) {
+        self.show_keyserver = true;
+        if self.keyserver_entries.is_empty() && self.keyserver_events.is_none() {
+            self.load_keyserver_list();
+        }
+    }
+
+    fn load_keyserver_list(&mut self) {
+        if self.keyserver_loading {
+            return;
+        }
+        let base = normalize_keyserver_url(&self.keyserver_url);
+        if base.is_empty() {
+            self.keyserver_status = "Bitte die Adresse des Keyservers eingeben.".into();
+            return;
+        }
+        self.keyserver_url = base.clone();
+        save_keyserver_url(&base);
+        self.keyserver_loading = true;
+        self.keyserver_status = "Lade Schlüssel vom Keyserver …".into();
+        self.keyserver_entries.clear();
+        self.keyserver_selected = None;
+        let (tx, rx) = mpsc::channel();
+        self.keyserver_events = Some(rx);
+        thread::spawn(move || {
+            let result = fetch_keyserver_list(&base);
+            let _ = tx.send(KeyserverEvent::Listed(result));
+        });
+    }
+
+    fn import_from_keyserver(&mut self) {
+        if self.keyserver_loading {
+            return;
+        }
+        let Some(index) = self.keyserver_selected else {
+            self.keyserver_status = "Bitte zuerst einen Schlüssel auswählen.".into();
+            return;
+        };
+        let Some(entry) = self.keyserver_entries.get(index).cloned() else {
+            self.keyserver_status = "Bitte zuerst einen Schlüssel auswählen.".into();
+            return;
+        };
+        let base = normalize_keyserver_url(&self.keyserver_url);
+        if base.is_empty() {
+            self.keyserver_status = "Bitte die Adresse des Keyservers eingeben.".into();
+            return;
+        }
+        let mut label = entry.owner.trim().to_owned();
+
+        if label.is_empty() {
+            label = format!("Schlüssel {}", entry.id);
+        }
+        self.keyserver_loading = true;
+        self.keyserver_status = format!("Lade Schlüssel für {label} …");
+        let (tx, rx) = mpsc::channel();
+        self.keyserver_events = Some(rx);
+        thread::spawn(move || {
+            let result = fetch_keyserver_key(&base, entry.id);
+            let _ = tx.send(KeyserverEvent::Downloaded { label, result });
+        });
+    }
+
+    fn poll_keyserver_events(&mut self) {
+        let Some(events) = self.keyserver_events.take() else {
+            return;
+        };
+        let mut received = false;
+        while let Ok(event) = events.try_recv() {
+            received = true;
+            match event {
+                KeyserverEvent::Listed(result) => {
+                    self.keyserver_loading = false;
+                    match result {
+                        Ok(entries) => {
+                            if entries.is_empty() {
+                                self.keyserver_status =
+                                    "Keine Schlüssel auf dem Keyserver gefunden.".into();
+                            } else {
+                                self.keyserver_status = format!(
+                                    "{} Schlüssel gefunden. Eintrag auswählen und importieren.",
+                                    entries.len()
+                                );
+                            }
+                            self.keyserver_entries = entries;
+                            self.keyserver_selected = None;
+                        }
+                        Err(error) => {
+                            self.keyserver_entries.clear();
+                            self.keyserver_selected = None;
+                            self.keyserver_status = format!("Fehler: {error}");
+                        }
+                    }
+                }
+                KeyserverEvent::Downloaded { label, result } => {
+                    self.keyserver_loading = false;
+                    match result {
+                        Ok(bytes) => match detect_key_method_bytes(&bytes) {
+                            Some(Method::Pgp) => {
+                                match self.store_recipient_key(&label, &bytes, Method::Pgp) {
+                                    Ok(()) => {
+                                        self.keyserver_status =
+                                            format!("Schlüssel für {label} importiert.");
+                                        self.status = self.keyserver_status.clone();
+                                    }
+                                    Err(error) => {
+                                        self.keyserver_status = format!("Fehler: {error}");
+                                    }
+                                }
+                            }
+                            Some(method) => {
+                                self.keyserver_status = format!(
+                                    "Der Keyserver hat einen {}-Schlüssel geliefert.",
+                                    method.label()
+                                );
+                            }
+                            None => {
+                                self.keyserver_status =
+                                    "Die Antwort ist kein gültiger OpenPGP-Schlüssel.".into();
+                            }
+                        },
+                        Err(error) => self.keyserver_status = format!("Fehler: {error}"),
+                    }
+                }
+                KeyserverEvent::Uploaded(result) => {
+    self.keyserver_loading = false;
+
+    match result {
+        Ok(message) => {
+            self.keyserver_owner.clear();
+            self.keyserver_upload_path = None;
+            self.keyserver_status = message;
+
+            self.load_keyserver_list();
+        }
+        Err(error) => {
+            self.keyserver_status = format!("Upload fehlgeschlagen: {error}");
+        }
+    }
+}
+            }
+        }
+        if !received {
+            self.keyserver_events = Some(events);
+        }
     }
 
     fn import_secret_key(&mut self) {
@@ -579,7 +929,9 @@ impl CryptoolApp {
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
-        let Some(events) = &self.events else { return };
+    self.poll_keyserver_events();
+
+    if let Some(events) = &self.events {
         while let Ok(event) = events.try_recv() {
             match event {
                 Event::Progress(progress) => self.progress = Some(progress),
@@ -599,9 +951,11 @@ impl CryptoolApp {
                     }
                 }
             }
-            ctx.request_repaint();
+             ctx.request_repaint();
         }
-        if self.running {
+    }
+
+         if self.running || self.keyserver_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -815,6 +1169,13 @@ impl CryptoolApp {
             }
         });
         ribbon_separator(ui);
+        ribbon_group(ui, "Öffentlicher Schlüssel", |ui| {
+            let available = self.method == Method::Pgp && !self.running && !self.keygen;
+            if ribbon_button(ui, RibbonIcon::Server, "Keyserver", false, available).clicked() {
+                self.open_keyserver();
+            }
+        });
+        ribbon_separator(ui);
         ribbon_group(ui, "Geheimer Schlüssel", |ui| {
             let available = self.method.key_based() && self.op.uses_secret_key() && !self.running;
             if ribbon_button(ui, RibbonIcon::KeyOpen, "Öffnen", false, available).clicked() {
@@ -829,6 +1190,141 @@ impl CryptoolApp {
                 self.show_about = true;
             }
         });
+    }
+
+    fn keyserver_window(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let mut open = true;
+        egui::Window::new("OpenPGP-Keyserver")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+
+                // Adresse + Abrufen
+                ui.label("Adresse des Keyservers");
+                ui.horizontal(|ui| {
+                    let address_width = (ui.available_width() - 96.0).max(160.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.keyserver_url)
+                            .hint_text("http://localhost:8080")
+                            .desired_width(address_width),
+                    );
+                    if ui
+                        .add_enabled(!self.keyserver_loading, egui::Button::new("Abrufen"))
+                        .clicked()
+                    {
+                        self.load_keyserver_list();
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(&self.keyserver_status)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(76, 88, 102)),
+                );
+                ui.separator();
+
+                // Liste
+                if self.keyserver_entries.is_empty() {
+                    ui.label("Noch keine Schlüssel geladen.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for index in 0..self.keyserver_entries.len() {
+                                let entry = &self.keyserver_entries[index];
+                                let text = if entry.filename.is_empty() {
+                                    format!("{} · ID {}", entry.owner, entry.id)
+                                } else {
+                                    format!(
+                                        "{} · {} · ID {}",
+                                        entry.owner, entry.filename, entry.id
+                                    )
+                                };
+                                let selected = self.keyserver_selected == Some(index);
+                                if ui.selectable_label(selected, text).clicked() {
+                                    self.keyserver_selected = Some(index);
+                                }
+                            }
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_import = self.keyserver_selected.is_some() && !self.keyserver_loading;
+                    if ui
+                        .add_enabled(can_import, egui::Button::new("In cryptool importieren"))
+                        .clicked()
+                    {
+                        self.import_from_keyserver();
+                    }
+                    if self.keyserver_loading {
+                        ui.spinner();
+                    }
+                });
+
+                // Upload
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label("Eigenen öffentlichen Schlüssel hochladen");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.keyserver_owner)
+                        .hint_text("Name oder E-Mail-Adresse")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.keyserver_loading,
+                            egui::Button::new("Schlüsseldatei auswählen"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("OpenPGP-Schlüssel", &["asc", "pgp", "gpg"])
+                            .pick_file()
+                        {
+                            self.keyserver_upload_path = Some(path);
+                        }
+                    }
+                    if let Some(path) = &self.keyserver_upload_path {
+                        ui.small(path.file_name().unwrap_or_default().to_string_lossy());
+                    }
+                });
+                let can_upload = !self.keyserver_loading
+                    && !self.keyserver_owner.trim().is_empty()
+                    && self.keyserver_upload_path.is_some();
+                if ui
+                    .add_enabled(
+                        can_upload,
+                        egui::Button::new("Öffentlichen Schlüssel hochladen"),
+                    )
+                    .clicked()
+                {
+                    self.upload_to_keyserver();
+                }
+
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Schließen").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if close || !open {
+            let url = normalize_keyserver_url(&self.keyserver_url);
+            if !url.is_empty() {
+                self.keyserver_url = url.clone();
+                save_keyserver_url(&url);
+            }
+            self.show_keyserver = false;
+        }
     }
 }
 
@@ -1208,22 +1704,93 @@ impl eframe::App for CryptoolApp {
                                                     },
                                                 );
                                             });
-                                            ui.add_space(6.0);
-                                            egui::Frame::new()
-                                                .fill(egui::Color32::from_rgb(239, 242, 245))
-                                                .corner_radius(egui::CornerRadius::same(9))
-                                                .inner_margin(egui::Margin::symmetric(12, 12))
-                                                .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    ui.label(self.input.as_deref().map_or_else(
-                                                        || {
-                                                            "Wähle eine Datei oder einen Ordner …"
-                                                                .to_owned()
-                                                        },
-                                                        |path| path.display().to_string(),
-                                                    ));
-                                                });
-                                        }
+                                            ui.add_space(8.0);
+
+// Datei- und Ordnerauswahl
+ui.horizontal(|ui| {
+    let text_active = self.method.key_based()
+        && self.text_mode
+        && !self.keygen
+        && self.op.is_text_allowed();
+
+    if ui
+        .add_enabled(
+            !self.running && !text_active,
+            egui::Button::new("Datei wählen"),
+        )
+        .clicked()
+    {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            self.input = Some(path);
+            self.signature = None;
+            self.status = "Datei ausgewählt.".into();
+        }
+    }
+
+    if ui
+        .add_enabled(
+            !self.running && !text_active && self.op == Op::Encrypt,
+            egui::Button::new("Ordner wählen"),
+        )
+        .clicked()
+    {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.input = Some(path);
+            self.signature = None;
+            self.status = "Ordner ausgewählt.".into();
+        }
+    }
+
+    if ui
+        .add_enabled(
+            !self.running && self.input.is_some(),
+            egui::Button::new("Entfernen"),
+        )
+        .clicked()
+    {
+        self.input = None;
+        self.signature = None;
+        self.status = "Auswahl entfernt.".into();
+    }
+});
+
+// Anzeige der aktuellen Auswahl
+egui::Frame::new()
+    .fill(egui::Color32::from_rgb(239, 242, 245))
+    .corner_radius(egui::CornerRadius::same(9))
+    .inner_margin(egui::Margin::symmetric(12, 12))
+    .show(ui, |ui| {
+        ui.set_width(ui.available_width());
+
+        if let Some(path) = &self.input {
+            let icon = if path.is_dir() {
+                "Ordner:"
+            } else {
+                "Datei:"
+            };
+
+            ui.label(
+                egui::RichText::new(icon)
+                    .strong()
+                    .color(ACCENT),
+            );
+
+            ui.add_space(3.0);
+
+            ui.label(
+                egui::RichText::new(path.display().to_string())
+                    .size(12.0),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Keine Datei oder kein Ordner ausgewählt.")
+                        .color(egui::Color32::from_rgb(115, 125, 137)),
+                );
+            });
+        }
+    });
+}
 
                                         ui.add_space(18.0);
                                         let needs_password = !self.method.key_based()
@@ -1384,6 +1951,10 @@ impl eframe::App for CryptoolApp {
                 self.show_about = false;
             }
         }
+
+        if self.show_keyserver {
+            self.keyserver_window(ui.ctx());
+        }
     }
 }
 
@@ -1514,6 +2085,7 @@ enum RibbonIcon {
     Folder,
     Text,
     Mail,
+    Server,
     Shield,
     Signature,
     Check,
@@ -1620,6 +2192,18 @@ fn draw_icon(painter: &egui::Painter, center: egui::Pos2, icon: RibbonIcon, colo
             );
             line(&[p(3.0, 5.5), p(9.0, 10.0), p(15.0, 5.5)]);
         }
+        RibbonIcon::Server => {
+            for row in 0..3 {
+                let top = 3.0 + row as f32 * 5.0;
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(p(3.0, top), p(15.0, top + 4.0)),
+                    egui::CornerRadius::same(1),
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                painter.circle_filled(p(12.0, top + 2.0), 0.7, color);
+            }
+        }
         RibbonIcon::Shield => {
             line(&[
                 p(9.0, 2.0),
@@ -1708,6 +2292,140 @@ fn recipient_key_dir() -> Option<PathBuf> {
 
 fn secret_key_dir() -> Option<PathBuf> {
     recipient_key_dir().map(|path| path.with_file_name("secret-keys"))
+}
+
+const KEYSERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const KEYSERVER_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+const DEFAULT_KEYSERVER_URL: &str = "http://localhost:8080";
+
+/// Speicherort der zuletzt verwendeten Keyserver-Adresse.
+fn keyserver_config_path() -> Option<PathBuf> {
+    recipient_key_dir().map(|path| path.with_file_name("keyserver-url.txt"))
+}
+
+fn select_keyserver_url(env: Option<&str>, saved: Option<&str>) -> String {
+    env.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| saved.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(DEFAULT_KEYSERVER_URL)
+        .to_owned()
+}
+
+/// Lädt die Adresse: Umgebungsvariable hat Vorrang, danach die zuletzt
+/// gespeicherte Adresse, sonst der Standardwert.
+fn load_keyserver_url() -> String {
+    let env = std::env::var("CRYPTOOL_KEYSERVER_URL").ok();
+    let saved = keyserver_config_path().and_then(|path| fs::read_to_string(path).ok());
+    select_keyserver_url(env.as_deref(), saved.as_deref())
+}
+
+fn save_keyserver_url(url: &str) {
+    let Some(path) = keyserver_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, format!("{url}\n"));
+}
+
+/// Ergänzt ein fehlendes Schema und entfernt einen abschließenden Schrägstrich.
+fn normalize_keyserver_url(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        trimmed.to_owned()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+fn fetch_keyserver_list(base: &str) -> Result<Vec<KeyserverEntry>, String> {
+    let url = format!("{base}/list");
+    let response = ureq::get(&url)
+        .timeout(KEYSERVER_TIMEOUT)
+        .call()
+        .map_err(|error| format!("Keyserver nicht erreichbar ({url}): {error}"))?;
+    let mut body = String::new();
+    response
+        .into_reader()
+        .take(KEYSERVER_MAX_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|error| format!("Antwort konnte nicht gelesen werden: {error}"))?;
+    Ok(parse_keyserver_list(&body))
+}
+
+fn fetch_keyserver_key(base: &str, id: u64) -> Result<Vec<u8>, String> {
+    let url = format!("{base}/download/{id}");
+    let response = ureq::get(&url)
+        .timeout(KEYSERVER_TIMEOUT)
+        .call()
+        .map_err(|error| format!("Schlüssel konnte nicht geladen werden ({url}): {error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(KEYSERVER_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Antwort konnte nicht gelesen werden: {error}"))?;
+    if bytes.is_empty() {
+        return Err("Der Keyserver hat eine leere Datei geliefert.".into());
+    }
+    Ok(bytes)
+}
+
+/// Liest die HTML-Tabelle von `/list`. Der Keyserver liefert bewusst nur HTML;
+/// deshalb werden die Zeilen und Zellen hier minimal ausgewertet.
+fn parse_keyserver_list(html: &str) -> Vec<KeyserverEntry> {
+    let mut entries = Vec::new();
+
+    for row in html.split("<tr").skip(1) {
+        let row = row.split("</tr>").next().unwrap_or(row);
+
+        let cells: Vec<String> = row
+            .split("<td")
+            .skip(1)
+            .filter_map(|cell| {
+                let start = cell.find('>')? + 1;
+                let end = cell.find("</td>")?;
+                Some(html_unescape(cell[start..end].trim()))
+            })
+            .collect();
+
+        if cells.len() < 3 {
+            continue;
+        }
+        let Ok(id) = cells[0].parse::<u64>() else {
+            continue;
+        };
+
+        
+        // ID | Kennung | Dateiname | Download
+        let owner = cells[1].clone();
+        let filename = if cells[2] == "-" {
+            String::new()
+        } else {
+            cells[2].clone()
+        };
+        let filename = if filename == "-" { String::new() } else { filename };
+
+        entries.push(KeyserverEntry { id, owner, filename });
+    }
+    entries
+}
+
+fn html_unescape(input: &str) -> String {
+    input
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 fn method_from_tag(tag: &str) -> Option<Method> {
@@ -2018,4 +2736,130 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_creation_context| Ok(Box::<CryptoolApp>::default())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_keyserver_list() {
+        let html = r#"
+            <table>
+              <tr><th>ID</th><th>Vorname</th><th>Nachname</th><th>Dateiname</th></tr>
+              <tr>
+                <td>7</td>
+                <td>Anna &amp; Co</td>
+                <td>Beispiel</td>
+                <td>anna.asc</td>
+                <td><a href="/download/7">Download</a></td>
+              </tr>
+              <tr><td colspan="5" style="text-align:center;">Keine Keys vorhanden.</td></tr>
+            </table>
+        "#;
+        let entries = parse_keyserver_list(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 7);
+        assert_eq!(entries[0].owner, "Anna & Co Beispiel");
+        assert_eq!(entries[0].firstname, "Anna & Co");
+        assert_eq!(entries[0].lastname, "Beispiel");
+        assert_eq!(entries[0].filename, "anna.asc");
+    }
+
+    #[test]
+    fn parses_missing_filename_as_empty() {
+        let html = "<tr><td>1</td><td>Anna</td><td>Beispiel</td><td>-</td></tr>";
+        let entries = parse_keyserver_list(html);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].filename.is_empty());
+    }
+
+    #[test]
+    fn normalizes_keyserver_url() {
+        assert_eq!(
+            normalize_keyserver_url("localhost:8080/"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            normalize_keyserver_url("https://keys.example.org/"),
+            "https://keys.example.org"
+        );
+        assert_eq!(normalize_keyserver_url("  "), "");
+    }
+
+    #[test]
+    fn selects_keyserver_url_prefers_env_then_saved() {
+        assert_eq!(
+            select_keyserver_url(Some(" https://env.example "), Some("https://saved.example")),
+            "https://env.example"
+        );
+        assert_eq!(
+            select_keyserver_url(None, Some(" https://saved.example\n")),
+            "https://saved.example"
+        );
+        assert_eq!(
+            select_keyserver_url(Some("  "), None),
+            DEFAULT_KEYSERVER_URL
+        );
+        assert_eq!(select_keyserver_url(None, None), DEFAULT_KEYSERVER_URL);
+    }
+
+    #[test]
+    fn fetches_keyserver_list_over_http() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /list "),
+                "unerwartete Anfrage: {request}"
+            );
+            let body = "<tr><td>7</td><td>Anna</td><td>Beispiel</td><td>anna.asc</td></tr>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let entries = fetch_keyserver_list(&format!("http://{address}")).unwrap();
+        server.join().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 7);
+        assert_eq!(entries[0].firstname, "Anna");
+    }
+
+    #[test]
+    fn fetches_keyserver_key_over_http() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /download/7 "),
+                "unerwartete Anfrage: {request}"
+            );
+            let body = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let bytes = fetch_keyserver_key(&format!("http://{address}"), 7).unwrap();
+        server.join().unwrap();
+        assert_eq!(bytes, b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n");
+    }
 }

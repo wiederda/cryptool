@@ -57,6 +57,29 @@ Geheime Schlüssel werden genauso importiert, aber nur bei „Entschlüsseln“ 
 „Signieren“ angeboten. Sie werden lokal gemerkt und können beim nächsten Start
 wieder aus der Liste gewählt werden.
 
+### Schlüssel vom PGP-Keyserver laden
+
+Öffentliche OpenPGP-Schlüssel lassen sich auch direkt aus einem PGP-Keyserver
+importieren:
+
+1. Verfahren **OpenPGP** wählen.
+2. Im Menüband **Schlüssel** auf **Keyserver** klicken.
+3. Adresse des Keyservers eintragen (Standard: `http://localhost:8080`) und
+   **Abrufen** wählen.
+4. Eintrag auswählen und **In cryptool importieren**.
+
+Die zuletzt verwendete Adresse wird gespeichert und beim nächsten Start
+automatisch geladen:
+
+```text
+%APPDATA%\cryptool\keyserver-url.txt
+```
+
+Die Umgebungsvariable `CRYPTOOL_KEYSERVER_URL` hat Vorrang vor der gespeicherten
+Adresse. Der Keyserver muss die Routen `GET /list` und `GET /download/<id>`
+bereitstellen (z. B. der mitgelieferte `pgp-keyserver`). Beim Import wird der
+Schlüssel wie ein manuell importierter Empfängerschlüssel lokal gespeichert.
+
 Ablageorte (Windows):
 
 ```text
@@ -279,7 +302,8 @@ cryptool encrypt x.bin --no-confirm
 
 ## Sicherheit und Grenzen
 
-- cryptool arbeitet lokal und baut keine Netzwerkverbindung auf.
+- cryptool arbeitet lokal. Nur der optionale Import vom PGP-Keyserver baut eine
+  Netzwerkverbindung auf.
 - CTX nutzt Argon2id und XChaCha20-Poly1305.
 - OpenPGP nutzt Ed25519 zur Signatur, X25519 zum Verschlüsseln und
   AES-256/OCB (SEIPD v2).
