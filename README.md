@@ -1,8 +1,8 @@
 # cryptool
 
 cryptool verschlüsselt und entschlüsselt Dateien, Ordner und Text **lokal** auf
-deinem Rechner. Es gibt eine grafische Oberfläche (`cryptool-gui`) und ein
-Kommandozeilenprogramm (`cryptool`). Beide nutzen dieselbe Bibliothek.
+deinem Rechner. Es gibt eine grafische Oberfläche (`cryptool`) und ein
+Kommandozeilenprogramm (`cryptool-cli`). Beide nutzen dieselbe Bibliothek.
 
 Es stehen drei Verfahren zur Auswahl:
 
@@ -23,8 +23,8 @@ Es stehen drei Verfahren zur Auswahl:
 
 Lade die aktuelle Version von den
 [GitHub Releases](https://github.com/wiederda/cryptool/releases) herunter.
-Unter Windows enthält das Archiv `cryptool-gui.exe` für die Oberfläche und
-`cryptool.exe` für die Kommandozeile. Eine Installation ist nicht nötig:
+Unter Windows enthält das Archiv `cryptool.exe` für die Oberfläche und
+`cryptool-cli.exe` für die Kommandozeile. Eine Installation ist nicht nötig:
 Archiv entpacken und die gewünschte Anwendung starten.
 
 ---
@@ -57,16 +57,21 @@ Geheime Schlüssel werden genauso importiert, aber nur bei „Entschlüsseln“ 
 „Signieren“ angeboten. Sie werden lokal gemerkt und können beim nächsten Start
 wieder aus der Liste gewählt werden.
 
-### Schlüssel vom PGP-Keyserver laden
+### Schlüssel vom Schlüsselserver laden und hochladen
 
-Öffentliche OpenPGP-Schlüssel lassen sich auch direkt aus einem PGP-Keyserver
-importieren:
+Öffentliche OpenPGP- und PQC-Schlüssel lassen sich auch direkt aus einem
+Schlüsselserver importieren:
 
-1. Verfahren **OpenPGP** wählen.
+1. Verfahren **OpenPGP** oder **PQC** wählen.
 2. Im Menüband **Schlüssel** auf **Keyserver** klicken.
 3. Adresse des Keyservers eintragen (Standard: `http://localhost:8080`) und
    **Abrufen** wählen.
 4. Eintrag auswählen und **In cryptool importieren**.
+
+Im selben Fenster kann der eigene öffentliche Schlüssel hochgeladen werden.
+Dazu Kennung (Name oder E-Mail-Adresse) und Schlüsseldatei wählen. OpenPGP- und
+PQC-Schlüssel werden anhand ihres Inhalts erkannt; geheime Schlüssel werden
+abgelehnt.
 
 Die zuletzt verwendete Adresse wird gespeichert und beim nächsten Start
 automatisch geladen:
@@ -76,9 +81,10 @@ automatisch geladen:
 ```
 
 Die Umgebungsvariable `CRYPTOOL_KEYSERVER_URL` hat Vorrang vor der gespeicherten
-Adresse. Der Keyserver muss die Routen `GET /list` und `GET /download/<id>`
-bereitstellen (z. B. der mitgelieferte `pgp-keyserver`). Beim Import wird der
-Schlüssel wie ein manuell importierter Empfängerschlüssel lokal gespeichert.
+Adresse. Der Schlüsselserver muss die Routen `GET /list` und
+`GET /download/<id>` bereitstellen (z. B. der mitgelieferte `pgp-keyserver`).
+Beim Import wird der Schlüssel wie ein manuell importierter Empfängerschlüssel
+lokal gespeichert.
 
 Ablageorte (Windows):
 
@@ -126,9 +132,9 @@ CTX unterstützt keinen Textmodus.
 ## Kommandozeile: Grundlagen
 
 ```text
-cryptool --help
-cryptool pgp --help
-cryptool pqc --help
+cryptool-cli --help
+cryptool-cli pgp --help
+cryptool-cli pqc --help
 ```
 
 Allgemeine Optionen:
@@ -143,13 +149,13 @@ Allgemeine Optionen:
 ### CTX: Dateien und Ordner mit Passwort
 
 ```text
-cryptool encrypt datei.txt
-cryptool decrypt datei.txt.ctx
+cryptool-cli encrypt datei.txt
+cryptool-cli decrypt datei.txt.ctx
 
-cryptool encrypt mein-ordner
-cryptool decrypt mein-ordner.ctx
+cryptool-cli encrypt mein-ordner
+cryptool-cli decrypt mein-ordner.ctx
 
-cryptool inspect mein-ordner.ctx
+cryptool-cli inspect mein-ordner.ctx
 ```
 
 Standardziele:
@@ -165,7 +171,7 @@ Standardziele:
 Schlüsselpaar erzeugen:
 
 ```text
-cryptool pgp keygen "Anna Beispiel <anna@example.org>"
+cryptool-cli pgp keygen "Anna Beispiel <anna@example.org>"
 ```
 
 Standarddateien:
@@ -178,21 +184,21 @@ schluessel.pub.asc   öffentlicher Schlüssel (weitergeben)
 Verschlüsseln und entschlüsseln:
 
 ```text
-cryptool pgp encrypt brief.txt --recipient anna.pub.asc
-cryptool pgp decrypt brief.txt.pgp --key anna.sec.asc
+cryptool-cli pgp encrypt brief.txt --recipient anna.pub.asc
+cryptool-cli pgp decrypt brief.txt.pgp --key anna.sec.asc
 ```
 
 Mit ASCII-Armor:
 
 ```text
-cryptool pgp encrypt brief.txt --recipient anna.pub.asc --armor
+cryptool-cli pgp encrypt brief.txt --recipient anna.pub.asc --armor
 ```
 
 Signieren und prüfen:
 
 ```text
-cryptool pgp sign brief.txt --key anna.sec.asc
-cryptool pgp verify brief.txt --key anna.pub.asc
+cryptool-cli pgp sign brief.txt --key anna.sec.asc
+cryptool-cli pgp verify brief.txt --key anna.pub.asc
 ```
 
 Standarddateien:
@@ -211,7 +217,7 @@ verwenden ML-DSA-65.
 Schlüsselpaar erzeugen:
 
 ```text
-cryptool pqc keygen "Anna Beispiel <anna@example.org>"
+cryptool-cli pqc keygen "Anna Beispiel <anna@example.org>"
 ```
 
 Standarddateien:
@@ -224,15 +230,15 @@ schluessel.pub.pqc   öffentlicher Schlüssel
 Verschlüsseln und entschlüsseln:
 
 ```text
-cryptool pqc encrypt brief.txt --recipient anna.pub.pqc
-cryptool pqc decrypt brief.txt.pqc --key anna.sec.pqc
+cryptool-cli pqc encrypt brief.txt --recipient anna.pub.pqc
+cryptool-cli pqc decrypt brief.txt.pqc --key anna.sec.pqc
 ```
 
 Signieren und prüfen:
 
 ```text
-cryptool pqc sign brief.txt --key anna.sec.pqc
-cryptool pqc verify brief.txt --key anna.pub.pqc
+cryptool-cli pqc sign brief.txt --key anna.sec.pqc
+cryptool-cli pqc verify brief.txt --key anna.pub.pqc
 ```
 
 Standarddateien:
@@ -254,9 +260,9 @@ Ohne Terminal fragt cryptool nicht interaktiv nach einem Passwort. Für Skripte
 gibt es deshalb:
 
 ```text
-echo "mein-passwort" | cryptool encrypt x.bin --password-stdin
-cryptool encrypt x.bin --password-file passwort.txt
-cryptool encrypt x.bin --no-confirm
+echo "mein-passwort" | cryptool-cli encrypt x.bin --password-stdin
+cryptool-cli encrypt x.bin --password-file passwort.txt
+cryptool-cli encrypt x.bin --no-confirm
 ```
 
 - `--password-stdin` liest die erste Zeile aus stdin.
@@ -302,8 +308,8 @@ cryptool encrypt x.bin --no-confirm
 
 ## Sicherheit und Grenzen
 
-- cryptool arbeitet lokal. Nur der optionale Import vom PGP-Keyserver baut eine
-  Netzwerkverbindung auf.
+- cryptool arbeitet lokal. Nur der optionale Import und Upload über den
+  Schlüsselserver baut eine Netzwerkverbindung auf.
 - CTX nutzt Argon2id und XChaCha20-Poly1305.
 - OpenPGP nutzt Ed25519 zur Signatur, X25519 zum Verschlüsseln und
   AES-256/OCB (SEIPD v2).
@@ -337,6 +343,6 @@ cryptool encrypt x.bin --no-confirm
 ```text
 crates/core   kryptografische Bausteine (Argon2id, XChaCha20-Poly1305)
 crates/lib    öffentliche API, Datei-/Ordnerabläufe, OpenPGP und PQC
-crates/cli    Kommandozeilenprogramm `cryptool`
-crates/gui    Desktop-Oberfläche `cryptool-gui` (egui)
+crates/cli    Kommandozeilenprogramm `cryptool-cli`
+crates/gui    Desktop-Oberfläche `cryptool` (egui)
 ```

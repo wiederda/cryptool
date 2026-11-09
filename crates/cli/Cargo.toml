@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "cryptool"
+name = "cryptool-cli"
 path = "src/main.rs"
 
 [dependencies]

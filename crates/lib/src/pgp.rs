@@ -119,9 +119,7 @@ fn pick_encryption_key(key: &SignedPublicKey) -> Result<&SignedPublicSubKey> {
 /// Signatur-Flag) wird der algorithmisch signaturfähige Primärschlüssel genutzt.
 fn pick_signing_key(key: &SignedSecretKey) -> Result<Box<&dyn SigningKey>> {
     for sub in &key.secret_subkeys {
-        if sub.algorithm().can_sign()
-            && sub.signatures.iter().any(|sig| sig.key_flags().sign())
-        {
+        if sub.algorithm().can_sign() && sub.signatures.iter().any(|sig| sig.key_flags().sign()) {
             return Ok(Box::new(&sub.key));
         }
     }
@@ -916,8 +914,8 @@ pub fn verify_path(
 
     let signer = user_id_of(&public);
     let created = sig.signature.created().map(|t| t.as_secs() as u64);
-    let has_issuer = !sig.signature.issuer_fingerprint().is_empty()
-        || !sig.signature.issuer_key_id().is_empty();
+    let has_issuer =
+        !sig.signature.issuer_fingerprint().is_empty() || !sig.signature.issuer_key_id().is_empty();
     let mut last_error = None;
 
     for sub in &public.public_subkeys {
@@ -1082,14 +1080,7 @@ mod tests {
         )
         .unwrap();
         assert!(sig.exists());
-        let report = verify_path(
-            &data,
-            &sig,
-            &public_out,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
+        let report = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap();
         assert!(report.signer.contains("Signer"));
         assert!(report.key_id.len() >= 16);
         assert!(report.created.is_some());
@@ -1110,25 +1101,11 @@ mod tests {
         assert!(fs::read_to_string(&armored)
             .unwrap()
             .starts_with("-----BEGIN PGP SIGNATURE-----"));
-        verify_path(
-            &data,
-            &armored,
-            &public_out,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
+        verify_path(&data, &armored, &public_out, &mut no_progress(), &cancel).unwrap();
 
         // Manipulierte Datei wird abgelehnt.
         fs::write(&data, b"manipuliert").unwrap();
-        let err = verify_path(
-            &data,
-            &sig,
-            &public_out,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap_err();
+        let err = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap_err();
         assert!(matches!(err, Error::SignatureInvalid));
 
         // Falscher öffentlicher Schlüssel wird abgelehnt.
@@ -1143,14 +1120,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let err = verify_path(
-            &data,
-            &sig,
-            &other_public,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap_err();
+        let err = verify_path(&data, &sig, &other_public, &mut no_progress(), &cancel).unwrap_err();
         assert!(matches!(err, Error::SignatureInvalid));
 
         // Ordner werden abgelehnt.

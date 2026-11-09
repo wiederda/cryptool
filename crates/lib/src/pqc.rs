@@ -36,11 +36,17 @@
 //!
 //! ## Schlüsseldateien
 //!
-//! Öffentliche und geheime Schlüssel werden als ASCII-Armor (Base64) geschrieben,
-//! können aber auch binär gelesen werden. Version 1 enthält nur den 64-Byte-Seed
-//! von ML-KEM-768. Version 2 enthält zusätzlich einen ML-DSA-65-Schlüssel; der
-//! geheime Schlüssel speichert beide Seeds (KEM + Signatur) mit Argon2id und
-//! XChaCha20-Poly1305 passphrasegeschützt.
+//! ML-KEM- und ML-DSA-Schlüssel werden getrennt gespeichert und verwenden
+//! ausschließlich standardisierte Formate:
+//!
+//! - **Öffentliche Schlüssel:** SubjectPublicKeyInfo (SPKI) nach RFC 5280,
+//!   wahlweise als PEM (`-----BEGIN PUBLIC KEY-----`) oder als DER.
+//! - **Geheime Schlüssel:** passwortgeschütztes PKCS#8 nach RFC 5958
+//!   (`-----BEGIN ENCRYPTED PRIVATE KEY-----`), ebenfalls als PEM oder DER.
+//!
+//! Es gibt demnach vier Schlüsseldateien: ML-KEM öffentlich/privat für die
+//! Verschlüsselung und ML-DSA öffentlich/privat für Signaturen. Die
+//! Schlüsseldateien enthalten keine cryptool-eigenen Metadaten mehr.
 //!
 //! ## Signaturdateien
 //!
@@ -63,24 +69,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::aead::{Aead, OsRng};
+use chacha20poly1305::aead::OsRng;
 use hkdf::Hkdf;
 use ml_dsa::signature::{DigestSigner, DigestVerifier};
 use ml_dsa::{
-    KeyExport as DsaKeyExport, KeyInit as DsaKeyInit, Keypair as DsaKeypair, MlDsa65,
-    Signature as MlDsaSignature, SignatureEncoding, SigningKey as MlDsaSigningKey,
-    VerifyingKey as MlDsaVerifyingKey,
+    Generate as DsaGenerate, Keypair as DsaKeypair, MlDsa65, Signature as MlDsaSignature,
+    SignatureEncoding, SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
 };
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
-use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768, Seed};
+use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768};
+use pkcs8::{
+    der::Decode as DerDecode, spki::AssociatedAlgorithmIdentifier, DecodePrivateKey,
+    DecodePublicKey, Document, EncodePrivateKey, EncodePublicKey, EncryptedPrivateKeyInfoRef,
+    LineEnding, PrivateKeyInfoRef, SecretDocument, SubjectPublicKeyInfoRef,
+};
 use sha2::{Digest, Sha256};
 use shake::Update;
 use zeroize::Zeroizing;
 
 use crate::engine::{
-    extract_archive, remap_error, scan_dir, with_part_dir, with_part_file, write_dir_stream,
-    write_file_stream, Dec, DecryptReader, Enc, EncryptWriter, Error, Fail, Progress, Report,
-    Result, Tracker, VerifyReport, TAG_LEN,
+    extract_archive, remap_error, scan_dir, with_part_dir, with_part_file,
+    write_dir_stream, write_file_stream, Dec, DecryptReader, Enc, EncryptWriter, Error, Fail,
+    Progress, Report, Result, Tracker, VerifyReport,
 };
 use crate::{ExposeSecret, SecretString};
 
@@ -88,10 +98,14 @@ use crate::{ExposeSecret, SecretString};
 pub const EXTENSION: &str = "pqc";
 /// Dateierweiterung für ASCII-Armor-Nachrichten (Textmodus).
 pub const TEXT_EXTENSION: &str = "pqc.asc";
-/// Endung für öffentliche Schlüsseldateien (z. B. `schluessel.pub.pqc`).
-pub const PUBLIC_KEY_EXTENSION: &str = "pub.pqc";
-/// Endung für geheime Schlüsseldateien (z. B. `schluessel.sec.pqc`).
-pub const SECRET_KEY_EXTENSION: &str = "sec.pqc";
+/// Endung für öffentliche ML-KEM-Schlüssel (SPKI, PEM).
+pub const KEM_PUBLIC_KEY_EXTENSION: &str = "kem.pub.pem";
+/// Endung für geheime ML-KEM-Schlüssel (verschlüsseltes PKCS#8, PEM).
+pub const KEM_SECRET_KEY_EXTENSION: &str = "kem.sec.pem";
+/// Endung für öffentliche ML-DSA-Schlüssel (SPKI, PEM).
+pub const DSA_PUBLIC_KEY_EXTENSION: &str = "dsa.pub.pem";
+/// Endung für geheime ML-DSA-Schlüssel (verschlüsseltes PKCS#8, PEM).
+pub const DSA_SECRET_KEY_EXTENSION: &str = "dsa.sec.pem";
 /// Endung für binäre abgetrennte Signaturen.
 pub const SIGNATURE_EXTENSION: &str = "pqc.sig";
 /// Endung für ASCII-Armor-Signaturen.
@@ -111,34 +125,14 @@ const NONCE_LEN: usize = 19; // 24 (XChaCha) - 5 (STREAM BE32)
 const KEM_CT_LEN: usize = 1088; // ML-KEM-768
 const HEADER_LEN: usize = 48 + KEM_CT_LEN;
 const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
-const KEM_EK_LEN: usize = 1184; // ML-KEM-768
-const KEM_SEED_LEN: usize = 64;
 
 const HKDF_INFO: &[u8] = b"cryptool-pqc-v1 ml-kem-768 xchacha20-poly1305";
 
-const KDF_M_KIB: u32 = 64 * 1024;
-const KDF_T: u32 = 3;
-const KDF_P: u32 = 1;
-
-const MAX_M_KIB: u32 = 1024 * 1024;
-const MAX_T: u32 = 10;
-const MAX_P: u32 = 16;
 const MIN_CHUNK: u32 = 1024;
 const MAX_CHUNK: u32 = 64 * 1024 * 1024;
 
-const PUBLIC_MAGIC: &[u8; 4] = b"CTPK";
-const SECRET_MAGIC: &[u8; 4] = b"CTSK";
-const KEY_VERSION_V1: u8 = 1;
-const KEY_VERSION_V2: u8 = 2;
-const KEY_ALG_MLKEM768: u8 = 1;
-const KEY_ALG_MLDSA65: u8 = 1;
-
-const DSA_VK_LEN: usize = 1952; // ML-DSA-65
-const DSA_SEED_LEN: usize = 32;
 const DSA_SIG_LEN: usize = 3309; // ML-DSA-65
 
-const PUBLIC_KEY_LABEL: &str = "CRYPTOOL PQC PUBLIC KEY";
-const SECRET_KEY_LABEL: &str = "CRYPTOOL PQC SECRET KEY";
 const MESSAGE_LABEL: &str = "CRYPTOOL PQC MESSAGE";
 
 const SIGNATURE_MAGIC: &[u8; 4] = b"CTSG";
@@ -153,36 +147,378 @@ fn invalid(message: impl Into<String>) -> Error {
 
 // --------------------------------------------------------------- Schlüsseldateien
 
+/// Art einer PQC-Schlüsseldatei. Die Schlüssel für Verschlüsselung (ML-KEM)
+/// und Signaturen (ML-DSA) werden getrennt gespeichert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    KemPublic,
+    KemSecret,
+    DsaPublic,
+    DsaSecret,
+}
+
+impl KeyKind {
+    pub fn is_public(self) -> bool {
+        matches!(self, Self::KemPublic | Self::DsaPublic)
+    }
+
+    pub fn is_secret(self) -> bool {
+        !self.is_public()
+    }
+
+    pub fn is_kem(self) -> bool {
+        matches!(self, Self::KemPublic | Self::KemSecret)
+    }
+
+    pub fn is_dsa(self) -> bool {
+        matches!(self, Self::DsaPublic | Self::DsaSecret)
+    }
+}
+
+/// Ausgabeformat für Schlüsseldateien.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyFormat {
+    /// Standard-PEM (`PUBLIC KEY` bzw. `ENCRYPTED PRIVATE KEY`).
+    #[default]
+    Pem,
+    /// Binäres DER (SPKI bzw. verschlüsseltes PKCS#8).
+    Der,
+}
+
+/// Geladener öffentlicher ML-KEM-Schlüssel.
 pub struct PublicKey {
-    pub user_id: String,
     key: EncapsulationKey<MlKem768>,
-    signing_key: Option<MlDsaVerifyingKey<MlDsa65>>,
+    id: String,
 }
 
 impl PublicKey {
-    /// `true`, wenn der Schlüssel eine Signaturprüfung erlaubt (Format v2).
-    pub fn can_verify(&self) -> bool {
-        self.signing_key.is_some()
-    }
-
-    /// Kurze, stabile Schlüsselkennung (erste 8 Byte des SHA-256-Fingerprints).
+    /// Kurze, stabile Schlüsselkennung (erste 8 Byte des SHA-256-Fingerprints
+    /// über das SPKI-DER).
     pub fn key_id(&self) -> String {
-        match &self.signing_key {
-            Some(key) => dsa_key_id(key),
-            None => kem_key_id(&self.key),
-        }
+        self.id.clone()
     }
 }
 
-struct SecretKeyFile {
-    user_id: String,
-    has_signing_key: bool,
-    m_kib: u32,
-    t: u32,
-    p: u32,
-    salt: [u8; SALT_LEN],
-    nonce: [u8; 24],
-    seed_ct: Vec<u8>,
+/// Geladener öffentlicher ML-DSA-Schlüssel.
+pub struct VerifyingKey {
+    key: MlDsaVerifyingKey<MlDsa65>,
+    id: String,
+}
+
+impl VerifyingKey {
+    /// Kurze, stabile Schlüsselkennung (erste 8 Byte des SHA-256-Fingerprints
+    /// über das SPKI-DER).
+    pub fn key_id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn short_id(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
+fn strip_leading_space(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn kem_algorithm_oid() -> pkcs8::ObjectIdentifier {
+    <MlKem768 as AssociatedAlgorithmIdentifier>::ALGORITHM_IDENTIFIER.oid
+}
+
+fn dsa_algorithm_oid() -> pkcs8::ObjectIdentifier {
+    <MlDsa65 as AssociatedAlgorithmIdentifier>::ALGORITHM_IDENTIFIER.oid
+}
+
+/// Liest eine PEM- oder DER-kodierte SPKI-Datei und liefert das DER zurück.
+fn public_key_der(bytes: &[u8]) -> Result<Vec<u8>> {
+    let bytes = strip_leading_space(bytes);
+    if bytes.starts_with(b"-----BEGIN ") {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| invalid("Öffentlicher Schlüssel: Datei ist kein gültiges UTF-8"))?;
+        let (label, document) = Document::from_pem(text)
+            .map_err(|_| invalid("Öffentlicher Schlüssel ist kein gültiges PEM/DER"))?;
+        if label != "PUBLIC KEY" {
+            return Err(invalid(format!(
+                "Öffentlicher Schlüssel: unerwartete PEM-Kennung „{label}“"
+            )));
+        }
+        Ok(document.as_bytes().to_vec())
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Erkennt, ob eine öffentliche Schlüsseldatei ein ML-KEM- oder ML-DSA-Schlüssel
+/// ist. Das funktioniert ohne Passphrase, weil die Algorithmus-OID im SPKI steht.
+pub fn detect_public_key_kind(bytes: &[u8]) -> Result<KeyKind> {
+    let der = public_key_der(bytes)?;
+    let spki = SubjectPublicKeyInfoRef::from_der(&der)
+        .map_err(|_| invalid("Öffentlicher Schlüssel ist kein gültiges SPKI"))?;
+    if spki.algorithm.oid == kem_algorithm_oid() {
+        Ok(KeyKind::KemPublic)
+    } else if spki.algorithm.oid == dsa_algorithm_oid() {
+        Ok(KeyKind::DsaPublic)
+    } else {
+        Err(invalid("Unbekannter öffentlicher Schlüsselalgorithmus"))
+    }
+}
+
+fn parse_public_key(path: &Path) -> Result<(KeyKind, Vec<u8>)> {
+    let der = public_key_der(&fs::read(path)?)?;
+    let spki = SubjectPublicKeyInfoRef::from_der(&der)
+        .map_err(|_| invalid("Öffentlicher Schlüssel ist kein gültiges SPKI"))?;
+    let kind = if spki.algorithm.oid == kem_algorithm_oid() {
+        KeyKind::KemPublic
+    } else if spki.algorithm.oid == dsa_algorithm_oid() {
+        KeyKind::DsaPublic
+    } else {
+        return Err(invalid("Unbekannter öffentlicher Schlüsselalgorithmus"));
+    };
+    Ok((kind, der))
+}
+
+/// Entschlüsselt ein verschlüsseltes PKCS#8-Dokument. Ein falsches Passwort
+/// wird als `WrongPasswordOrCorrupt` gemeldet.
+fn decrypt_private_key(
+    encrypted: &EncryptedPrivateKeyInfoRef<'_>,
+    passphrase: &SecretString,
+) -> Result<Vec<u8>> {
+    let document = encrypted
+        .decrypt(passphrase.expose_secret())
+        .map_err(|_| Error::WrongPasswordOrCorrupt)?;
+    Ok(document.as_bytes().to_vec())
+}
+
+/// Liest eine geheime Schlüsseldatei (verschlüsseltes PKCS#8 als PEM oder DER).
+/// Unverschlüsseltes PKCS#8 wird beim Import ebenfalls akzeptiert.
+fn private_key_der(path: &Path, passphrase: &SecretString) -> Result<Vec<u8>> {
+    let bytes = fs::read(path)?;
+    let bytes = strip_leading_space(&bytes);
+    if bytes.starts_with(b"-----BEGIN ") {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| invalid("Geheimer Schlüssel: Datei ist kein gültiges UTF-8"))?;
+        let (label, document) = SecretDocument::from_pem(text)
+            .map_err(|_| invalid("Geheimer Schlüssel ist kein gültiges PEM/DER"))?;
+        match label {
+            "ENCRYPTED PRIVATE KEY" => {
+                let encrypted = EncryptedPrivateKeyInfoRef::try_from(document.as_bytes())
+                    .map_err(|_| invalid("Verschlüsselter Schlüssel ist kein gültiges PKCS#8"))?;
+                decrypt_private_key(&encrypted, passphrase)
+            }
+            "PRIVATE KEY" => Ok(document.as_bytes().to_vec()),
+            other => Err(invalid(format!(
+                "Geheimer Schlüssel: unerwartete PEM-Kennung „{other}“"
+            ))),
+        }
+    } else if let Ok(encrypted) = EncryptedPrivateKeyInfoRef::try_from(bytes) {
+        decrypt_private_key(&encrypted, passphrase)
+    } else {
+        PrivateKeyInfoRef::try_from(bytes)
+            .map_err(|_| invalid("Geheimer Schlüssel ist kein gültiges PKCS#8"))?;
+        Ok(bytes.to_vec())
+    }
+}
+
+fn parse_private_key(path: &Path, passphrase: &SecretString) -> Result<(KeyKind, Vec<u8>)> {
+    let der = private_key_der(path, passphrase)?;
+    let info = PrivateKeyInfoRef::try_from(der.as_slice())
+        .map_err(|_| invalid("Geheimer Schlüssel ist kein gültiges PKCS#8"))?;
+    let kind = if info.algorithm.oid == kem_algorithm_oid() {
+        KeyKind::KemSecret
+    } else if info.algorithm.oid == dsa_algorithm_oid() {
+        KeyKind::DsaSecret
+    } else {
+        return Err(invalid("Unbekannter geheimer Schlüsselalgorithmus"));
+    };
+    Ok((kind, der))
+}
+
+/// Lädt einen öffentlichen ML-KEM-Schlüssel (SPKI als PEM oder DER).
+pub fn load_public_key(path: &Path) -> Result<PublicKey> {
+    let (kind, der) = parse_public_key(path)?;
+    if kind != KeyKind::KemPublic {
+        return Err(invalid(
+            "Das ist ein ML-DSA-Schlüssel; zum Verschlüsseln wird ein ML-KEM-Schlüssel benötigt",
+        ));
+    }
+    let key = EncapsulationKey::<MlKem768>::from_public_key_der(&der)
+        .map_err(|_| invalid("Öffentlicher ML-KEM-Schlüssel ist ungültig"))?;
+    Ok(PublicKey {
+        key,
+        id: short_id(&der),
+    })
+}
+
+/// Lädt einen öffentlichen ML-DSA-Schlüssel (SPKI als PEM oder DER).
+pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey> {
+    let (kind, der) = parse_public_key(path)?;
+    if kind != KeyKind::DsaPublic {
+        return Err(invalid(
+            "Das ist ein ML-KEM-Schlüssel; zum Prüfen wird ein ML-DSA-Schlüssel benötigt",
+        ));
+    }
+    let key = MlDsaVerifyingKey::<MlDsa65>::from_public_key_der(&der)
+        .map_err(|_| invalid("Öffentlicher ML-DSA-Schlüssel ist ungültig"))?;
+    Ok(VerifyingKey {
+        key,
+        id: short_id(&der),
+    })
+}
+
+fn load_kem_secret(path: &Path, passphrase: &SecretString) -> Result<DecapsulationKey<MlKem768>> {
+    let (kind, der) = parse_private_key(path, passphrase)?;
+    if kind != KeyKind::KemSecret {
+        return Err(invalid(
+            "Das ist ein ML-DSA-Schlüssel; zum Entschlüsseln wird ein ML-KEM-Schlüssel benötigt",
+        ));
+    }
+    DecapsulationKey::<MlKem768>::from_pkcs8_der(&der)
+        .map_err(|_| invalid("Geheimer ML-KEM-Schlüssel ist ungültig"))
+}
+
+fn load_dsa_secret(path: &Path, passphrase: &SecretString) -> Result<MlDsaSigningKey<MlDsa65>> {
+    let (kind, der) = parse_private_key(path, passphrase)?;
+    if kind != KeyKind::DsaSecret {
+        return Err(invalid(
+            "Das ist ein ML-KEM-Schlüssel; zum Signieren wird ein ML-DSA-Schlüssel benötigt",
+        ));
+    }
+    MlDsaSigningKey::<MlDsa65>::from_pkcs8_der(&der)
+        .map_err(|_| invalid("Geheimer ML-DSA-Schlüssel ist ungültig"))
+}
+
+fn write_key_bytes(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
+    with_part_file(path, force, |writer| {
+        writer.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+fn key_error(what: &str, error: impl std::fmt::Display) -> Error {
+    invalid(format!("{what}: {error}"))
+}
+
+/// Erzeugt getrennte ML-KEM-768- und ML-DSA-65-Schlüsselpaare und schreibt vier
+/// standardisierte Schlüsseldateien.
+///
+/// Öffentliche Schlüssel werden als SPKI (PEM oder DER) geschrieben, geheime
+/// Schlüssel als passwortgeschütztes PKCS#8 (PEM oder DER).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_key(
+    passphrase: SecretString,
+    kem_secret_out: &Path,
+    kem_public_out: &Path,
+    dsa_secret_out: &Path,
+    dsa_public_out: &Path,
+    format: KeyFormat,
+    force: bool,
+) -> Result<()> {
+    if passphrase.expose_secret().is_empty() {
+        return Err(invalid("Leere Passphrase ist nicht erlaubt"));
+    }
+
+    let outputs = [
+        kem_secret_out,
+        kem_public_out,
+        dsa_secret_out,
+        dsa_public_out,
+    ];
+    for (index, output) in outputs.iter().enumerate() {
+        if outputs[index + 1..].contains(output) {
+            return Err(invalid(
+                "Die vier Schlüsseldateien benötigen getrennte Pfade",
+            ));
+        }
+        if output.exists() && !force {
+            return Err(Error::OutputExists(output.to_path_buf()));
+        }
+    }
+
+    let (decapsulation_key, encapsulation_key) = MlKem768::generate_keypair();
+    let signing_key = MlDsaSigningKey::<MlDsa65>::generate();
+    let verifying_key = signing_key.verifying_key();
+
+    let (kem_public, kem_secret, dsa_public, dsa_secret) = match format {
+        KeyFormat::Pem => {
+            let kem_public = encapsulation_key
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|error| {
+                    key_error("ML-KEM-Schlüssel konnte nicht kodiert werden", error)
+                })?;
+            let kem_secret = decapsulation_key
+                .to_pkcs8_encrypted_pem(passphrase.expose_secret(), LineEnding::LF)
+                .map_err(|error| {
+                    key_error(
+                        "Geheimer ML-KEM-Schlüssel konnte nicht kodiert werden",
+                        error,
+                    )
+                })?;
+            let dsa_public = verifying_key
+                .to_public_key_pem(LineEnding::LF)
+                .map_err(|error| {
+                    key_error("ML-DSA-Schlüssel konnte nicht kodiert werden", error)
+                })?;
+            let dsa_secret = signing_key
+                .to_pkcs8_encrypted_pem(passphrase.expose_secret(), LineEnding::LF)
+                .map_err(|error| {
+                    key_error(
+                        "Geheimer ML-DSA-Schlüssel konnte nicht kodiert werden",
+                        error,
+                    )
+                })?;
+            (
+                kem_public.into_bytes(),
+                kem_secret.as_bytes().to_vec(),
+                dsa_public.into_bytes(),
+                dsa_secret.as_bytes().to_vec(),
+            )
+        }
+        KeyFormat::Der => {
+            let kem_public = encapsulation_key.to_public_key_der().map_err(|error| {
+                key_error("ML-KEM-Schlüssel konnte nicht kodiert werden", error)
+            })?;
+            let kem_secret = decapsulation_key
+                .to_pkcs8_encrypted_der(passphrase.expose_secret())
+                .map_err(|error| {
+                    key_error(
+                        "Geheimer ML-KEM-Schlüssel konnte nicht kodiert werden",
+                        error,
+                    )
+                })?;
+            let dsa_public = verifying_key.to_public_key_der().map_err(|error| {
+                key_error("ML-DSA-Schlüssel konnte nicht kodiert werden", error)
+            })?;
+            let dsa_secret = signing_key
+                .to_pkcs8_encrypted_der(passphrase.expose_secret())
+                .map_err(|error| {
+                    key_error(
+                        "Geheimer ML-DSA-Schlüssel konnte nicht kodiert werden",
+                        error,
+                    )
+                })?;
+            (
+                kem_public.as_bytes().to_vec(),
+                kem_secret.as_bytes().to_vec(),
+                dsa_public.as_bytes().to_vec(),
+                dsa_secret.as_bytes().to_vec(),
+            )
+        }
+    };
+
+    write_key_bytes(kem_secret_out, &kem_secret, force)?;
+    write_key_bytes(kem_public_out, &kem_public, force)?;
+    write_key_bytes(dsa_secret_out, &dsa_secret, force)?;
+    write_key_bytes(dsa_public_out, &dsa_public, force)?;
+    Ok(())
 }
 
 fn armor(label: &str, data: &[u8]) -> String {
@@ -222,7 +558,7 @@ fn unarmor(text: &str, label: &str) -> Result<Vec<u8>> {
         .map_err(|_| invalid(format!("{label}: Base64 ist ungültig")))
 }
 
-/// Liest eine Schlüsseldatei; ASCII-Armor und binäre Dateien werden akzeptiert.
+/// Liest eine Signaturdatei; ASCII-Armor und binäre Dateien werden akzeptiert.
 fn read_key_file(path: &Path, label: &str) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(b"-----BEGIN ") {
@@ -232,17 +568,6 @@ fn read_key_file(path: &Path, label: &str) -> Result<Vec<u8>> {
     } else {
         Ok(bytes)
     }
-}
-
-fn write_key_file(path: &Path, label: &str, blob: &[u8], force: bool) -> Result<()> {
-    if path.exists() && !force {
-        return Err(Error::OutputExists(path.to_path_buf()));
-    }
-    let armored = armor(label, blob);
-    with_part_file(path, true, |w| {
-        w.write_all(armored.as_bytes())?;
-        Ok(())
-    })
 }
 
 fn take<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
@@ -265,275 +590,6 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         take(data, pos, 4)?.try_into().expect("vier Bytes"),
     ))
-}
-
-fn dsa_verifying_key(bytes: &[u8]) -> Result<MlDsaVerifyingKey<MlDsa65>> {
-    let raw = bytes
-        .try_into()
-        .map_err(|_| invalid("Öffentlicher ML-DSA-Schlüssel hat eine ungültige Länge"))?;
-    Ok(MlDsaVerifyingKey::<MlDsa65>::new(&raw))
-}
-
-fn short_id(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect()
-}
-
-fn dsa_key_id(key: &MlDsaVerifyingKey<MlDsa65>) -> String {
-    let bytes = DsaKeyExport::to_bytes(key);
-    short_id(bytes.as_slice())
-}
-
-fn kem_key_id(key: &EncapsulationKey<MlKem768>) -> String {
-    let bytes = key.to_bytes();
-    short_id(bytes.as_slice())
-}
-
-fn parse_public_key(blob: &[u8]) -> Result<PublicKey> {
-    let mut pos = 0usize;
-    if take(blob, &mut pos, 4)? != PUBLIC_MAGIC {
-        return Err(invalid("Keine cryptool-PQC-Schlüsseldatei"));
-    }
-    let version = take(blob, &mut pos, 1)?[0];
-    if !matches!(version, KEY_VERSION_V1 | KEY_VERSION_V2) {
-        return Err(invalid("Nicht unterstützte PQC-Schlüsselversion"));
-    }
-    if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLKEM768 {
-        return Err(invalid("Nicht unterstützter PQC-Schlüsselalgorithmus"));
-    }
-    let has_signing_key = if version == KEY_VERSION_V2 {
-        if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLDSA65 {
-            return Err(invalid("Nicht unterstützter PQC-Signaturalgorithmus"));
-        }
-        true
-    } else {
-        false
-    };
-    let id_len = read_u16(blob, &mut pos)? as usize;
-    let user_id = std::str::from_utf8(take(blob, &mut pos, id_len)?)
-        .map_err(|_| invalid("Nutzerkennung im Schlüssel ist kein UTF-8"))?
-        .to_owned();
-    let ek_bytes = take(blob, &mut pos, KEM_EK_LEN)?;
-    let signing_key = if has_signing_key {
-        Some(dsa_verifying_key(take(blob, &mut pos, DSA_VK_LEN)?)?)
-    } else {
-        None
-    };
-    if pos != blob.len() {
-        return Err(invalid("PQC-Schlüsseldatei enthält unerwartete Daten"));
-    }
-    let raw: ml_kem::Key<EncapsulationKey<MlKem768>> = ek_bytes
-        .try_into()
-        .map_err(|_| invalid("Öffentlicher ML-KEM-Schlüssel hat eine ungültige Länge"))?;
-    let key = EncapsulationKey::<MlKem768>::new(&raw)
-        .map_err(|_| invalid("Öffentlicher ML-KEM-Schlüssel ist ungültig"))?;
-    Ok(PublicKey {
-        user_id,
-        key,
-        signing_key,
-    })
-}
-
-fn parse_secret_key(blob: &[u8]) -> Result<SecretKeyFile> {
-    let mut pos = 0usize;
-    if take(blob, &mut pos, 4)? != SECRET_MAGIC {
-        return Err(invalid("Keine cryptool-PQC-Schlüsseldatei"));
-    }
-    let version = take(blob, &mut pos, 1)?[0];
-    if !matches!(version, KEY_VERSION_V1 | KEY_VERSION_V2) {
-        return Err(invalid("Nicht unterstützte PQC-Schlüsselversion"));
-    }
-    if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLKEM768 {
-        return Err(invalid("Nicht unterstützter PQC-Schlüsselalgorithmus"));
-    }
-    let has_signing_key = if version == KEY_VERSION_V2 {
-        if take(blob, &mut pos, 1)?[0] != KEY_ALG_MLDSA65 {
-            return Err(invalid("Nicht unterstützter PQC-Signaturalgorithmus"));
-        }
-        true
-    } else {
-        false
-    };
-    let id_len = read_u16(blob, &mut pos)? as usize;
-    let user_id = std::str::from_utf8(take(blob, &mut pos, id_len)?)
-        .map_err(|_| invalid("Nutzerkennung im Schlüssel ist kein UTF-8"))?
-        .to_owned();
-    let m_kib = read_u32(blob, &mut pos)?;
-    let t = read_u32(blob, &mut pos)?;
-    let p = read_u32(blob, &mut pos)?;
-    if !(1..=MAX_M_KIB).contains(&m_kib) || !(1..=MAX_T).contains(&t) || !(1..=MAX_P).contains(&p) {
-        return Err(invalid("Ungültige KDF-Parameter im PQC-Schlüssel"));
-    }
-    let salt: [u8; SALT_LEN] = take(blob, &mut pos, SALT_LEN)?
-        .try_into()
-        .expect("Salt-Länge");
-    let nonce: [u8; 24] = take(blob, &mut pos, 24)?.try_into().expect("Nonce-Länge");
-    let ct_len = read_u32(blob, &mut pos)? as usize;
-    let seed_len = if has_signing_key {
-        KEM_SEED_LEN + DSA_SEED_LEN
-    } else {
-        KEM_SEED_LEN
-    };
-    if ct_len != seed_len + TAG_LEN {
-        return Err(invalid("Ungültige Länge des geschützten PQC-Schlüssels"));
-    }
-    let seed_ct = take(blob, &mut pos, ct_len)?.to_vec();
-    if pos != blob.len() {
-        return Err(invalid("PQC-Schlüsseldatei enthält unerwartete Daten"));
-    }
-    Ok(SecretKeyFile {
-        user_id,
-        has_signing_key,
-        m_kib,
-        t,
-        p,
-        salt,
-        nonce,
-        seed_ct,
-    })
-}
-
-fn decrypt_seed(
-    passphrase: SecretString,
-    salt: &[u8; SALT_LEN],
-    nonce: &[u8; 24],
-    seed_ct: &[u8],
-    m_kib: u32,
-    t: u32,
-    p: u32,
-    seed_len: usize,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let key = cryptool_core::derive_key(passphrase.expose_secret(), salt, m_kib, t, p)
-        .map_err(Error::Kdf)?;
-    let cipher = cryptool_core::xchacha20poly1305(&key);
-    let seed = cipher
-        .decrypt(GenericArray::from_slice(nonce), seed_ct)
-        .map_err(|_| Error::WrongPasswordOrCorrupt)?;
-    if seed.len() != seed_len {
-        return Err(Error::Corrupt);
-    }
-    Ok(Zeroizing::new(seed))
-}
-
-/// Lädt einen öffentlichen PQC-Schlüssel (ASCII-Armor oder binär).
-pub fn load_public_key(path: &Path) -> Result<PublicKey> {
-    parse_public_key(&read_key_file(path, PUBLIC_KEY_LABEL)?)
-}
-
-fn load_secret_seed(
-    path: &Path,
-    passphrase: SecretString,
-) -> Result<(String, bool, Zeroizing<Vec<u8>>)> {
-    let blob = read_key_file(path, SECRET_KEY_LABEL)?;
-    let parsed = parse_secret_key(&blob)?;
-    let seed_len = if parsed.has_signing_key {
-        KEM_SEED_LEN + DSA_SEED_LEN
-    } else {
-        KEM_SEED_LEN
-    };
-    let seed = decrypt_seed(
-        passphrase,
-        &parsed.salt,
-        &parsed.nonce,
-        &parsed.seed_ct,
-        parsed.m_kib,
-        parsed.t,
-        parsed.p,
-        seed_len,
-    )?;
-    Ok((parsed.user_id, parsed.has_signing_key, seed))
-}
-
-/// Erzeugt ein ML-KEM-768-Schlüsselpaar. Beide Dateien werden als ASCII-Armor
-/// geschrieben; der geheime Schlüssel ist mit der Passphrase geschützt.
-pub fn generate_key(
-    user_id: &str,
-    passphrase: SecretString,
-    secret_out: &Path,
-    public_out: &Path,
-    force: bool,
-) -> Result<()> {
-    if user_id.len() > u16::MAX as usize {
-        return Err(invalid("Nutzerkennung ist zu lang"));
-    }
-    for out in [secret_out, public_out] {
-        if out.exists() && !force {
-            return Err(Error::OutputExists(out.to_path_buf()));
-        }
-    }
-    if secret_out == public_out {
-        return Err(invalid(
-            "Geheimer und öffentlicher Schlüssel benötigen getrennte Dateien",
-        ));
-    }
-
-    let (dk, ek) = MlKem768::generate_keypair();
-    let kem_seed = dk
-        .to_seed()
-        .ok_or_else(|| invalid("ML-KEM-Schlüssel konnte nicht serialisiert werden"))?;
-
-    // Signaturschlüssel: ML-DSA-65 aus einem zufälligen 32-Byte-Seed.
-    let mut dsa_seed = [0u8; DSA_SEED_LEN];
-    use chacha20poly1305::aead::rand_core::RngCore;
-    OsRng.fill_bytes(&mut dsa_seed);
-    let dsa_seed_array: ml_dsa::Seed = (&dsa_seed[..])
-        .try_into()
-        .map_err(|_| invalid("ML-DSA-Seed hat eine ungültige Länge"))?;
-    let signing_key = MlDsaSigningKey::<MlDsa65>::from_seed(&dsa_seed_array);
-    let verifying_key = signing_key.verifying_key();
-    let vk_bytes = DsaKeyExport::to_bytes(&verifying_key);
-
-    // Öffentlicher Schlüssel (v2): Nutzerkennung + ML-KEM- + ML-DSA-Schlüssel.
-    let ek_bytes = ek.to_bytes();
-    let mut public_blob = Vec::with_capacity(9 + user_id.len() + KEM_EK_LEN + DSA_VK_LEN);
-    public_blob.extend_from_slice(PUBLIC_MAGIC);
-    public_blob.push(KEY_VERSION_V2);
-    public_blob.push(KEY_ALG_MLKEM768);
-    public_blob.push(KEY_ALG_MLDSA65);
-    public_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
-    public_blob.extend_from_slice(user_id.as_bytes());
-    public_blob.extend_from_slice(ek_bytes.as_slice());
-    public_blob.extend_from_slice(vk_bytes.as_slice());
-
-    // Geheimer Schlüssel (v2): beide Seeds mit Argon2id + XChaCha20-Poly1305
-    // geschützt.
-    let mut seed_blob = Zeroizing::new(Vec::with_capacity(KEM_SEED_LEN + DSA_SEED_LEN));
-    seed_blob.extend_from_slice(kem_seed.as_slice());
-    seed_blob.extend_from_slice(&dsa_seed);
-
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce);
-    let key = cryptool_core::derive_key(passphrase.expose_secret(), &salt, KDF_M_KIB, KDF_T, KDF_P)
-        .map_err(Error::Kdf)?;
-    let cipher = cryptool_core::xchacha20poly1305(&key);
-    let seed_ct = cipher
-        .encrypt(GenericArray::from_slice(&nonce), seed_blob.as_slice())
-        .map_err(|_| Error::Crypto)?;
-
-    let mut secret_blob =
-        Vec::with_capacity(9 + user_id.len() + 12 + SALT_LEN + 24 + 4 + seed_ct.len());
-    secret_blob.extend_from_slice(SECRET_MAGIC);
-    secret_blob.push(KEY_VERSION_V2);
-    secret_blob.push(KEY_ALG_MLKEM768);
-    secret_blob.push(KEY_ALG_MLDSA65);
-    secret_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
-    secret_blob.extend_from_slice(user_id.as_bytes());
-    secret_blob.extend_from_slice(&KDF_M_KIB.to_le_bytes());
-    secret_blob.extend_from_slice(&KDF_T.to_le_bytes());
-    secret_blob.extend_from_slice(&KDF_P.to_le_bytes());
-    secret_blob.extend_from_slice(&salt);
-    secret_blob.extend_from_slice(&nonce);
-    secret_blob.extend_from_slice(&(seed_ct.len() as u32).to_le_bytes());
-    secret_blob.extend_from_slice(&seed_ct);
-
-    write_key_file(secret_out, SECRET_KEY_LABEL, &secret_blob, force)?;
-    write_key_file(public_out, PUBLIC_KEY_LABEL, &public_blob, force)?;
-    Ok(())
 }
 
 // ------------------------------------------------------------------- Nachrichten
@@ -656,16 +712,8 @@ fn message_key(
     secret_key_file: &Path,
     passphrase: SecretString,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let (_user_id, _has_signing_key, seed) = load_secret_seed(secret_key_file, passphrase)?;
-    let kem_seed = seed
-        .as_slice()
-        .get(..KEM_SEED_LEN)
-        .ok_or_else(|| invalid("PQC-Schlüssel hat eine ungültige Länge"))?;
-    let seed: Seed = kem_seed
-        .try_into()
-        .map_err(|_| invalid("PQC-Schlüssel hat eine ungültige Länge"))?;
-    let dk = DecapsulationKey::<MlKem768>::from_seed(seed);
-    let shared = dk
+    let decapsulation_key = load_kem_secret(secret_key_file, &passphrase)?;
+    let shared = decapsulation_key
         .decapsulate_slice(&header.kem_ct)
         .map_err(|_| invalid("ML-KEM-Ciphertext hat eine ungültige Länge"))?;
     derive_key(shared.as_slice(), &header.salt)
@@ -897,21 +945,15 @@ pub fn sign_path(
     cancel: &AtomicBool,
 ) -> Result<()> {
     if input.is_dir() {
-        return Err(invalid("Signieren wird nur für einzelne Dateien unterstützt"));
-    }
-    let (user_id, has_signing_key, seed) = load_secret_seed(secret_key_file, passphrase)?;
-    if !has_signing_key {
         return Err(invalid(
-            "Der PQC-Schlüssel (Format v1) enthält keinen Signaturschlüssel; bitte ein neues Schlüsselpaar erzeugen",
+            "Signieren wird nur für einzelne Dateien unterstützt",
         ));
     }
-    let dsa_seed: ml_dsa::Seed = seed
-        .as_slice()
-        .get(KEM_SEED_LEN..)
-        .ok_or_else(|| invalid("PQC-Schlüssel hat eine ungültige Länge"))?
-        .try_into()
-        .map_err(|_| invalid("ML-DSA-Seed hat eine ungültige Länge"))?;
-    let signing_key = MlDsaSigningKey::<MlDsa65>::from_seed(&dsa_seed);
+    let signing_key = load_dsa_secret(secret_key_file, &passphrase)?;
+    // Standardisierte PKCS#8-Schlüssel enthalten keine Nutzerkennung. Die
+    // Signaturdatei bleibt trotzdem zum bisherigen Format kompatibel und
+    // speichert hier eine leere Kennung.
+    let user_id = String::new();
 
     let total = fs::metadata(input)?.len();
     let reader = RefCell::new(DigestReader {
@@ -984,12 +1026,12 @@ pub fn verify_path(
     cancel: &AtomicBool,
 ) -> Result<VerifyReport> {
     if input.is_dir() {
-        return Err(invalid("Signaturprüfung wird nur für einzelne Dateien unterstützt"));
+        return Err(invalid(
+            "Signaturprüfung wird nur für einzelne Dateien unterstützt",
+        ));
     }
-    let public = load_public_key(public_key_file)?;
-    let verifying_key = public.signing_key.as_ref().ok_or_else(|| {
-        invalid("Der PQC-Schlüssel (Format v1) enthält keinen Signaturschlüssel")
-    })?;
+    let verifying = load_verifying_key(public_key_file)?;
+    let verifying_key = &verifying.key;
     let (signer, sig_bytes) = read_signature(signature_file)?;
     let signature = MlDsaSignature::<MlDsa65>::try_from(sig_bytes.as_slice())
         .map_err(|_| invalid("PQC-Signatur ist ungültig kodiert"))?;
@@ -1022,11 +1064,11 @@ pub fn verify_path(
     match result {
         Ok(()) => Ok(VerifyReport {
             signer: if signer.is_empty() {
-                public.user_id.clone()
+                verifying.key_id()
             } else {
                 signer
             },
-            key_id: public.key_id(),
+            key_id: verifying.key_id(),
             created: None,
         }),
         Err(_) => {
@@ -1045,64 +1087,130 @@ pub fn verify_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn no_progress() -> impl FnMut(Progress) {
         |_p: Progress| {}
     }
 
+    struct KeyFiles {
+        kem_secret: PathBuf,
+        kem_public: PathBuf,
+        dsa_secret: PathBuf,
+        dsa_public: PathBuf,
+    }
+
+    fn generate(
+        root: &Path,
+        prefix: &str,
+        passphrase: &SecretString,
+        format: KeyFormat,
+    ) -> KeyFiles {
+        let ext = match format {
+            KeyFormat::Pem => "pem",
+            KeyFormat::Der => "der",
+        };
+        let keys = KeyFiles {
+            kem_secret: root.join(format!("{prefix}-kem.sec.{ext}")),
+            kem_public: root.join(format!("{prefix}-kem.pub.{ext}")),
+            dsa_secret: root.join(format!("{prefix}-dsa.sec.{ext}")),
+            dsa_public: root.join(format!("{prefix}-dsa.pub.{ext}")),
+        };
+        generate_key(
+            passphrase.clone(),
+            &keys.kem_secret,
+            &keys.kem_public,
+            &keys.dsa_secret,
+            &keys.dsa_public,
+            format,
+            true,
+        )
+        .unwrap();
+        keys
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn encrypt_decrypt_file(root: &Path, keys: &KeyFiles, passphrase: &SecretString) {
+        let cancel = AtomicBool::new(false);
+        let input = root.join("datei.bin");
+        fs::write(&input, b"geheime datei").unwrap();
+        let encrypted = root.join("datei.bin.pqc");
+        encrypt_path(
+            &input,
+            &encrypted,
+            &keys.kem_public,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        let output = root.join("datei.ret");
+        decrypt_path(
+            &encrypted,
+            &output,
+            &keys.kem_secret,
+            passphrase.clone(),
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"geheime datei");
+    }
+
+    fn sign_verify_file(root: &Path, keys: &KeyFiles, passphrase: &SecretString) {
+        let cancel = AtomicBool::new(false);
+        let input = root.join("signatur.txt");
+        fs::write(&input, b"zu signierende datei").unwrap();
+        let signature = root.join("signatur.txt.pqc.sig");
+        sign_path(
+            &input,
+            &signature,
+            &keys.dsa_secret,
+            passphrase.clone(),
+            false,
+            true,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        let report = verify_path(
+            &input,
+            &signature,
+            &keys.dsa_public,
+            &mut no_progress(),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(report.signer, report.key_id);
+        assert!(!report.key_id.is_empty());
+    }
+
     #[test]
     fn file_dir_and_text_roundtrip() {
-        let root = std::env::temp_dir().join("cryptool-pqc-rtrip-test");
-        let _ = fs::remove_dir_all(&root);
+        let root = temp_root("cryptool-pqc-rtrip-test");
+        let pw = SecretString::new("testpw".to_owned());
+        let keys = generate(&root, "pem", &pw, KeyFormat::Pem);
+        let cancel = AtomicBool::new(false);
+
+        encrypt_decrypt_file(&root, &keys, &pw);
+
         let src = root.join("src");
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("a.txt"), b"HALLO WELT").unwrap();
         fs::write(src.join("sub").join("b.txt"), b"UNTERORDNER").unwrap();
 
-        let secret_out = root.join("s.sec.pqc");
-        let public_out = root.join("p.pub.pqc");
-        let pw = SecretString::new("testpw".to_owned());
-        generate_key(
-            "Test <t@example.de>",
-            pw.clone(),
-            &secret_out,
-            &public_out,
-            true,
-        )
-        .unwrap();
-
-        let cancel = AtomicBool::new(false);
-
-        let file_in = root.join("datei.bin");
-        fs::write(&file_in, b"geheime datei").unwrap();
-        let file_enc = root.join("datei.bin.pqc");
-        encrypt_path(
-            &file_in,
-            &file_enc,
-            &public_out,
-            true,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
-        let file_ret = root.join("datei.ret");
-        decrypt_path(
-            &file_enc,
-            &file_ret,
-            &secret_out,
-            pw.clone(),
-            true,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(fs::read(&file_ret).unwrap(), b"geheime datei");
-
         let dir_enc = root.join("src.pqc");
         encrypt_path(
             &src,
             &dir_enc,
-            &public_out,
+            &keys.kem_public,
             true,
             &mut no_progress(),
             &cancel,
@@ -1112,7 +1220,7 @@ mod tests {
         decrypt_path(
             &dir_enc,
             &dir_ret,
-            &secret_out,
+            &keys.kem_secret,
             pw.clone(),
             true,
             &mut no_progress(),
@@ -1126,9 +1234,9 @@ mod tests {
         );
 
         let text = "Hallo PQC";
-        let armored = encrypt_text(text, &public_out).unwrap();
+        let armored = encrypt_text(text, &keys.kem_public).unwrap();
         assert!(armored.starts_with("-----BEGIN CRYPTOOL PQC MESSAGE-----"));
-        let plain = decrypt_text(&armored, &secret_out, pw).unwrap();
+        let plain = decrypt_text(&armored, &keys.kem_secret, pw).unwrap();
         assert_eq!(plain, text);
 
         let _ = fs::remove_dir_all(&root);
@@ -1136,44 +1244,34 @@ mod tests {
 
     #[test]
     fn large_text_roundtrip() {
-        let root = std::env::temp_dir().join("cryptool-pqc-large-text-test");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let secret_out = root.join("s.sec.pqc");
-        let public_out = root.join("p.pub.pqc");
+        let root = temp_root("cryptool-pqc-large-text-test");
         let pw = SecretString::new("testpw".to_owned());
-        generate_key("Test", pw.clone(), &secret_out, &public_out, true).unwrap();
+        let keys = generate(&root, "pem", &pw, KeyFormat::Pem);
 
         // Mehr als eine Chunk-Größe, damit die STREAM-Chunkung geprüft wird.
         let text = "Ä".repeat(3 * 1024 * 1024);
-        let armored = encrypt_text(&text, &public_out).unwrap();
-        let plain = decrypt_text(&armored, &secret_out, pw).unwrap();
+        let armored = encrypt_text(&text, &keys.kem_public).unwrap();
+        let plain = decrypt_text(&armored, &keys.kem_secret, pw).unwrap();
         assert_eq!(plain, text);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn wrong_passphrase_is_rejected() {
-        let root = std::env::temp_dir().join("cryptool-pqc-wrongpw-test");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let secret_out = root.join("s.sec.pqc");
-        let public_out = root.join("p.pub.pqc");
-        generate_key(
-            "Test",
-            SecretString::new("richtig".to_owned()),
-            &secret_out,
-            &public_out,
-            true,
-        )
-        .unwrap();
+        let root = temp_root("cryptool-pqc-wrongpw-test");
+        let keys = generate(
+            &root,
+            "pem",
+            &SecretString::new("richtig".to_owned()),
+            KeyFormat::Pem,
+        );
         let data = root.join("d.txt");
         fs::write(&data, b"x").unwrap();
         let enc = root.join("d.pqc");
         encrypt_path(
             &data,
             &enc,
-            &public_out,
+            &keys.kem_public,
             true,
             &mut no_progress(),
             &AtomicBool::new(false),
@@ -1182,7 +1280,7 @@ mod tests {
         let err = decrypt_path(
             &enc,
             &root.join("out"),
-            &secret_out,
+            &keys.kem_secret,
             SecretString::new("falsch".to_owned()),
             true,
             &mut no_progress(),
@@ -1195,31 +1293,20 @@ mod tests {
 
     #[test]
     fn sign_and_verify_roundtrip() {
-        let root = std::env::temp_dir().join("cryptool-pqc-sign-test");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let secret_out = root.join("s.sec.pqc");
-        let public_out = root.join("p.pub.pqc");
+        let root = temp_root("cryptool-pqc-sign-test");
         let pw = SecretString::new("testpw".to_owned());
-        generate_key(
-            "Signer <s@example.de>",
-            pw.clone(),
-            &secret_out,
-            &public_out,
-            true,
-        )
-        .unwrap();
+        let keys = generate(&root, "pem", &pw, KeyFormat::Pem);
+        let cancel = AtomicBool::new(false);
+
+        sign_verify_file(&root, &keys, &pw);
 
         let data = root.join("d.txt");
         fs::write(&data, b"zu signierende datei").unwrap();
-        let cancel = AtomicBool::new(false);
-
-        // Binäre Signatur
         let sig = root.join("d.txt.pqc.sig");
         sign_path(
             &data,
             &sig,
-            &secret_out,
+            &keys.dsa_secret,
             pw.clone(),
             false,
             true,
@@ -1227,17 +1314,13 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let report = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap();
-        assert_eq!(report.signer, "Signer <s@example.de>");
-        assert!(!report.key_id.is_empty());
-        assert!(report.created.is_none());
 
         // ASCII-Armor-Signatur
         let armored = root.join("d.txt.pqc.sig.asc");
         sign_path(
             &data,
             &armored,
-            &secret_out,
+            &keys.dsa_secret,
             pw.clone(),
             true,
             true,
@@ -1251,7 +1334,7 @@ mod tests {
         verify_path(
             &data,
             &armored,
-            &public_out,
+            &keys.dsa_public,
             &mut no_progress(),
             &cancel,
         )
@@ -1259,22 +1342,15 @@ mod tests {
 
         // Manipulierte Datei wird abgelehnt.
         fs::write(&data, b"manipuliert").unwrap();
-        let err = verify_path(&data, &sig, &public_out, &mut no_progress(), &cancel).unwrap_err();
+        let err =
+            verify_path(&data, &sig, &keys.dsa_public, &mut no_progress(), &cancel).unwrap_err();
         assert!(matches!(err, Error::SignatureInvalid));
 
         // Falscher öffentlicher Schlüssel wird abgelehnt.
         fs::write(&data, b"zu signierende datei").unwrap();
-        let other_secret = root.join("o.sec.pqc");
-        let other_public = root.join("o.pub.pqc");
-        generate_key(
-            "Andere <a@example.de>",
-            pw,
-            &other_secret,
-            &other_public,
-            true,
-        )
-        .unwrap();
-        let err = verify_path(&data, &sig, &other_public, &mut no_progress(), &cancel).unwrap_err();
+        let other = generate(&root, "other", &pw, KeyFormat::Pem);
+        let err =
+            verify_path(&data, &sig, &other.dsa_public, &mut no_progress(), &cancel).unwrap_err();
         assert!(matches!(err, Error::SignatureInvalid));
 
         // Ordner werden abgelehnt.
@@ -1283,7 +1359,7 @@ mod tests {
         let err = sign_path(
             &dir,
             &root.join("dir.pqc.sig"),
-            &secret_out,
+            &keys.dsa_secret,
             SecretString::new("testpw".to_owned()),
             false,
             true,
@@ -1296,111 +1372,122 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Schreibt ein Schlüsselpaar im alten v1-Format (nur ML-KEM).
-    fn write_v1_keypair(
-        root: &Path,
-        user_id: &str,
-        passphrase: &SecretString,
-    ) -> (std::path::PathBuf, std::path::PathBuf) {
-        use chacha20poly1305::aead::rand_core::RngCore;
-        let (dk, ek) = MlKem768::generate_keypair();
-        let seed = dk.to_seed().unwrap();
-        let ek_bytes = ek.to_bytes();
+    #[test]
+    fn pem_key_files_are_standardized() {
+        let root = temp_root("cryptool-pqc-pem-format-test");
+        let pw = SecretString::new("testpw".to_owned());
+        let keys = generate(&root, "pem", &pw, KeyFormat::Pem);
 
-        let mut public_blob = Vec::new();
-        public_blob.extend_from_slice(PUBLIC_MAGIC);
-        public_blob.push(KEY_VERSION_V1);
-        public_blob.push(KEY_ALG_MLKEM768);
-        public_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
-        public_blob.extend_from_slice(user_id.as_bytes());
-        public_blob.extend_from_slice(ek_bytes.as_slice());
+        for path in [&keys.kem_public, &keys.dsa_public] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(text.starts_with("-----BEGIN PUBLIC KEY-----"), "{text}");
+            assert!(text.trim_end().ends_with("-----END PUBLIC KEY-----"));
+        }
+        for path in [&keys.kem_secret, &keys.dsa_secret] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(
+                text.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----"),
+                "{text}"
+            );
+            assert!(text
+                .trim_end()
+                .ends_with("-----END ENCRYPTED PRIVATE KEY-----"));
+            assert!(!text.contains("CRYPTOOL"));
+        }
 
-        let mut salt = [0u8; SALT_LEN];
-        let mut nonce = [0u8; 24];
-        OsRng.fill_bytes(&mut salt);
-        OsRng.fill_bytes(&mut nonce);
-        let key = cryptool_core::derive_key(
-            passphrase.expose_secret(),
-            &salt,
-            KDF_M_KIB,
-            KDF_T,
-            KDF_P,
-        )
-        .unwrap();
-        let seed_ct = cryptool_core::xchacha20poly1305(&key)
-            .encrypt(GenericArray::from_slice(&nonce), seed.as_slice())
-            .unwrap();
+        assert_eq!(
+            detect_public_key_kind(&fs::read(&keys.kem_public).unwrap()).unwrap(),
+            KeyKind::KemPublic
+        );
+        assert_eq!(
+            detect_public_key_kind(&fs::read(&keys.dsa_public).unwrap()).unwrap(),
+            KeyKind::DsaPublic
+        );
 
-        let mut secret_blob = Vec::new();
-        secret_blob.extend_from_slice(SECRET_MAGIC);
-        secret_blob.push(KEY_VERSION_V1);
-        secret_blob.push(KEY_ALG_MLKEM768);
-        secret_blob.extend_from_slice(&(user_id.len() as u16).to_le_bytes());
-        secret_blob.extend_from_slice(user_id.as_bytes());
-        secret_blob.extend_from_slice(&KDF_M_KIB.to_le_bytes());
-        secret_blob.extend_from_slice(&KDF_T.to_le_bytes());
-        secret_blob.extend_from_slice(&KDF_P.to_le_bytes());
-        secret_blob.extend_from_slice(&salt);
-        secret_blob.extend_from_slice(&nonce);
-        secret_blob.extend_from_slice(&(seed_ct.len() as u32).to_le_bytes());
-        secret_blob.extend_from_slice(&seed_ct);
+        // Öffentliche und geheime Schlüssel lassen sich über die standardisierten
+        // Formate erneut laden.
+        load_public_key(&keys.kem_public).unwrap();
+        load_verifying_key(&keys.dsa_public).unwrap();
+        load_kem_secret(&keys.kem_secret, &pw).unwrap();
+        load_dsa_secret(&keys.dsa_secret, &pw).unwrap();
 
-        let secret_out = root.join("v1.sec.pqc");
-        let public_out = root.join("v1.pub.pqc");
-        write_key_file(&secret_out, SECRET_KEY_LABEL, &secret_blob, true).unwrap();
-        write_key_file(&public_out, PUBLIC_KEY_LABEL, &public_blob, true).unwrap();
-        (secret_out, public_out)
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn v1_keys_still_encrypt_but_cannot_sign() {
-        let root = std::env::temp_dir().join("cryptool-pqc-v1-test");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+    fn der_key_files_are_standardized_and_work() {
+        let root = temp_root("cryptool-pqc-der-format-test");
         let pw = SecretString::new("testpw".to_owned());
-        let (secret_out, public_out) = write_v1_keypair(&root, "Alt <a@example.de>", &pw);
+        let keys = generate(&root, "der", &pw, KeyFormat::Der);
 
-        let public = load_public_key(&public_out).unwrap();
-        assert!(!public.can_verify());
+        for path in [
+            &keys.kem_public,
+            &keys.dsa_public,
+            &keys.kem_secret,
+            &keys.dsa_secret,
+        ] {
+            let bytes = fs::read(path).unwrap();
+            assert!(!bytes.starts_with(b"-----BEGIN "));
+        }
 
-        let cancel = AtomicBool::new(false);
-        let data = root.join("d.txt");
-        fs::write(&data, b"v1 kompatibel").unwrap();
-        let enc = root.join("d.pqc");
-        encrypt_path(
-            &data,
-            &enc,
-            &public_out,
-            true,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
-        let out = root.join("d.out");
-        decrypt_path(
-            &enc,
-            &out,
-            &secret_out,
-            pw.clone(),
-            true,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(fs::read(&out).unwrap(), b"v1 kompatibel");
+        assert_eq!(
+            detect_public_key_kind(&fs::read(&keys.kem_public).unwrap()).unwrap(),
+            KeyKind::KemPublic
+        );
+        assert_eq!(
+            detect_public_key_kind(&fs::read(&keys.dsa_public).unwrap()).unwrap(),
+            KeyKind::DsaPublic
+        );
 
-        let err = sign_path(
-            &data,
-            &root.join("d.pqc.sig"),
-            &secret_out,
-            pw,
-            false,
-            true,
-            &mut no_progress(),
-            &cancel,
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Invalid(_)));
+        load_public_key(&keys.kem_public).unwrap();
+        load_verifying_key(&keys.dsa_public).unwrap();
+        load_kem_secret(&keys.kem_secret, &pw).unwrap();
+        load_dsa_secret(&keys.dsa_secret, &pw).unwrap();
+
+        encrypt_decrypt_file(&root, &keys, &pw);
+        sign_verify_file(&root, &keys, &pw);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wrong_key_kind_is_rejected() {
+        let root = temp_root("cryptool-pqc-wrong-kind-test");
+        let pw = SecretString::new("testpw".to_owned());
+        let keys = generate(&root, "pem", &pw, KeyFormat::Pem);
+
+        // ML-DSA ist kein KEM-Schlüssel usw.
+        assert!(load_public_key(&keys.dsa_public).is_err());
+        assert!(load_verifying_key(&keys.kem_public).is_err());
+        assert!(load_kem_secret(&keys.dsa_secret, &pw).is_err());
+        assert!(load_dsa_secret(&keys.kem_secret, &pw).is_err());
+
+        // Auch die Dateiendungen werden nicht blind vertraut: eine umbenannte
+        // ML-DSA-Datei bleibt ein ML-DSA-Schlüssel.
+        let renamed = root.join("vertauscht-kem.pub.pem");
+        fs::copy(&keys.dsa_public, &renamed).unwrap();
+        assert_eq!(
+            detect_public_key_kind(&fs::read(&renamed).unwrap()).unwrap(),
+            KeyKind::DsaPublic
+        );
+        assert!(load_public_key(&renamed).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unencrypted_pkcs8_import_is_accepted() {
+        let root = temp_root("cryptool-pqc-plain-pkcs8-test");
+        let signing_key = MlDsaSigningKey::<MlDsa65>::generate();
+        let document = signing_key.to_pkcs8_der().unwrap();
+        let pem = document.to_pem("PRIVATE KEY", LineEnding::LF).unwrap();
+        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+        let path = root.join("dsa.sec.pem");
+        fs::write(&path, pem.as_bytes()).unwrap();
+
+        let pw = SecretString::new("beliebig".to_owned());
+        load_dsa_secret(&path, &pw).unwrap();
+        load_kem_secret(&path, &pw).unwrap_err();
 
         let _ = fs::remove_dir_all(&root);
     }

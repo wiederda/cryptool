@@ -1,11 +1,11 @@
 [package]
-name = "cryptool-gui"
+name = "cryptool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "cryptool-gui"
+name = "cryptool"
 path = "src/main.rs"
 
 [dependencies]

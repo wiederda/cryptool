@@ -11,8 +11,9 @@ use std::thread;
 use cryptool_lib::{
     decrypt_path, encrypt_path, pgp_decrypt_path, pgp_decrypt_text, pgp_encrypt_path,
     pgp_encrypt_text, pgp_generate_key, pgp_sign_path, pgp_verify_path, pqc_decrypt_path,
-    pqc_decrypt_text, pqc_encrypt_path, pqc_encrypt_text, pqc_generate_key, pqc_sign_path,
-    pqc_verify_path, Progress, SecretString, VerifyReport,
+    pqc_decrypt_text, pqc_detect_public_key_kind, pqc_encrypt_path, pqc_encrypt_text,
+    pqc_generate_key, pqc_sign_path, pqc_verify_path, PqcKeyFormat, PqcKeyKind, Progress,
+    SecretString, VerifyReport,
 };
 use eframe::egui;
 use zeroize::Zeroize;
@@ -154,6 +155,7 @@ struct RecipientKey {
     label: String,
     path: PathBuf,
     method: Method,
+    kind: Option<PqcKeyKind>,
 }
 
 #[derive(Clone)]
@@ -161,6 +163,62 @@ struct SecretKey {
     label: String,
     path: PathBuf,
     method: Method,
+    kind: Option<PqcKeyKind>,
+}
+
+/// Für eine PQC-Operation benötigte Schlüsselart. PGP-Schlüssel haben keine
+/// Unterart und liefern `None`.
+fn required_pqc_key_kind(method: Method, op: Op) -> Option<PqcKeyKind> {
+    if method != Method::Pqc {
+        return None;
+    }
+    match op {
+        Op::Encrypt => Some(PqcKeyKind::KemPublic),
+        Op::Decrypt => Some(PqcKeyKind::KemSecret),
+        Op::Sign => Some(PqcKeyKind::DsaSecret),
+        Op::Verify => Some(PqcKeyKind::DsaPublic),
+    }
+}
+
+fn pqc_kind_tag(kind: Option<PqcKeyKind>) -> &'static str {
+    match kind {
+        Some(PqcKeyKind::KemPublic) | Some(PqcKeyKind::KemSecret) => "kem",
+        Some(PqcKeyKind::DsaPublic) | Some(PqcKeyKind::DsaSecret) => "dsa",
+        None => "-",
+    }
+}
+
+fn pqc_kind_from_tag(tag: &str) -> Option<PqcKeyKind> {
+    match tag {
+        "kem" => Some(PqcKeyKind::KemPublic),
+        "dsa" => Some(PqcKeyKind::DsaPublic),
+        _ => None,
+    }
+}
+
+fn secret_kind_from_tag(tag: &str) -> Option<PqcKeyKind> {
+    match tag {
+        "kem" => Some(PqcKeyKind::KemSecret),
+        "dsa" => Some(PqcKeyKind::DsaSecret),
+        _ => None,
+    }
+}
+
+/// Rate die Schlüsselart eines geheimen PQC-Schlüssels anhand des Dateinamens.
+/// Verschlüsselte PKCS#8-Dateien enthalten die Algorithmus-OID erst im
+/// entschlüsselten Teil, deshalb ist der Name hier die einzige verfügbare
+/// Information. Übliche Namen (`…-kem.sec.pem`, `…-dsa.sec.pem`) werden
+/// erkannt; sonst bleibt die Art unbekannt und der Schlüssel wird bei beiden
+/// PQC-Operationen angeboten.
+fn secret_kind_from_name(path: &Path) -> Option<PqcKeyKind> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if name.contains("dsa") {
+        Some(PqcKeyKind::DsaSecret)
+    } else if name.contains("kem") {
+        Some(PqcKeyKind::KemSecret)
+    } else {
+        None
+    }
 }
 
 struct CryptoolApp {
@@ -263,7 +321,19 @@ impl CryptoolApp {
             self.status = "Die Schlüsseldatei konnte nicht gelesen werden.".into();
             return;
         };
-        match self.store_recipient_key(&label, &bytes, method) {
+        let kind = if method == Method::Pqc {
+            match pqc_detect_public_key_kind(&bytes) {
+                Ok(kind) => Some(kind),
+                Err(_) => {
+                    self.status =
+                        "Die Datei ist kein gültiger PQC-Schlüssel (SPKI als PEM oder DER).".into();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        match self.store_recipient_key(&label, &bytes, method, kind) {
             Ok(()) => {
                 self.recipient_label.clear();
                 self.status = format!("Öffentlicher Schlüssel für {label} importiert.");
@@ -273,112 +343,107 @@ impl CryptoolApp {
     }
 
     fn upload_to_keyserver(&mut self) {
-    if self.keyserver_loading {
-        return;
+        if self.keyserver_loading {
+            return;
+        }
+
+        let owner = self.keyserver_owner.trim().to_owned();
+
+        if owner.is_empty() || owner.contains(['\r', '\n']) {
+            self.keyserver_status = "Bitte eine gültige Kennung eingeben.".into();
+            return;
+        }
+
+        let Some(path) = self.keyserver_upload_path.clone() else {
+            self.keyserver_status = "Bitte eine öffentliche Schlüsseldatei auswählen.".into();
+            return;
+        };
+
+        let base = normalize_keyserver_url(&self.keyserver_url);
+
+        if base.is_empty() {
+            self.keyserver_status = "Bitte die Keyserver-Adresse eingeben.".into();
+            return;
+        }
+
+        self.keyserver_loading = true;
+        self.keyserver_status = "Übertrage öffentlichen Schlüssel …".into();
+
+        let (tx, rx) = mpsc::channel();
+        self.keyserver_events = Some(rx);
+
+        thread::spawn(move || {
+            let result = Self::upload_keyserver_key(&base, &owner, &path);
+            let _ = tx.send(KeyserverEvent::Uploaded(result));
+        });
     }
 
-    let owner = self.keyserver_owner.trim().to_owned();
+    fn upload_keyserver_key(base: &str, owner: &str, path: &Path) -> Result<String, String> {
+        let metadata =
+            fs::metadata(path).map_err(|e| format!("Datei konnte nicht gelesen werden: {e}"))?;
 
-    if owner.is_empty() || owner.contains(['\r', '\n']) {
-        self.keyserver_status = "Bitte eine gültige Kennung eingeben.".into();
-        return;
-    }
+        if metadata.len() == 0 || metadata.len() > KEYSERVER_MAX_BYTES {
+            return Err("Die Schlüsseldatei ist leer oder größer als 4 MB.".into());
+        }
 
-    let Some(path) = self.keyserver_upload_path.clone() else {
-        self.keyserver_status = "Bitte eine öffentliche Schlüsseldatei auswählen.".into();
-        return;
-    };
+        let bytes = fs::read(path)
+            .map_err(|e| format!("Schlüsseldatei konnte nicht gelesen werden: {e}"))?;
 
-    let base = normalize_keyserver_url(&self.keyserver_url);
+        if detect_key_method_bytes(&bytes) != Some(Method::Pgp) {
+            return Err("Die Datei enthält keinen gültigen OpenPGP-Schlüssel.".into());
+        }
 
-    if base.is_empty() {
-        self.keyserver_status = "Bitte die Keyserver-Adresse eingeben.".into();
-        return;
-    }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("public-key.asc")
+            .replace(['"', '\r', '\n'], "_");
 
-    self.keyserver_loading = true;
-    self.keyserver_status = "Übertrage öffentlichen Schlüssel …".into();
+        let boundary = format!(
+            "----cryptool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
 
-    let (tx, rx) = mpsc::channel();
-    self.keyserver_events = Some(rx);
+        let mut body = Vec::new();
 
-    thread::spawn(move || {
-        let result = Self::upload_keyserver_key(&base, &owner, &path);
-        let _ = tx.send(KeyserverEvent::Uploaded(result));
-    });
-}
-
-fn upload_keyserver_key(
-    base: &str,
-    owner: &str,
-    path: &Path,
-) -> Result<String, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| format!("Datei konnte nicht gelesen werden: {e}"))?;
-
-    if metadata.len() == 0 || metadata.len() > KEYSERVER_MAX_BYTES {
-        return Err("Die Schlüsseldatei ist leer oder größer als 4 MB.".into());
-    }
-
-    let bytes = fs::read(path)
-        .map_err(|e| format!("Schlüsseldatei konnte nicht gelesen werden: {e}"))?;
-
-    if detect_key_method_bytes(&bytes) != Some(Method::Pgp) {
-        return Err("Die Datei enthält keinen gültigen OpenPGP-Schlüssel.".into());
-    }
-
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("public-key.asc")
-        .replace(['"', '\r', '\n'], "_");
-
-    let boundary = format!(
-        "----cryptool-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-
-    let mut body = Vec::new();
-
-    // Kennung
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\n\
+        // Kennung
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\n\
              Content-Disposition: form-data; name=\"owner\"\r\n\r\n\
              {owner}\r\n"
-        )
-        .as_bytes(),
-    );
+            )
+            .as_bytes(),
+        );
 
-    // Schlüsseldatei
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\n\
+        // Schlüsseldatei
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\n\
              Content-Disposition: form-data; name=\"pgpfile\"; filename=\"{filename}\"\r\n\
              Content-Type: application/pgp-keys\r\n\r\n"
-        )
-        .as_bytes(),
-    );
+            )
+            .as_bytes(),
+        );
 
-    body.extend_from_slice(&bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let url = format!("{base}/submit");
+        let url = format!("{base}/submit");
 
-    let response = ureq::post(&url)
-        .timeout(KEYSERVER_TIMEOUT)
-        .set(
-            "Content-Type",
-            &format!("multipart/form-data; boundary={boundary}"),
-        )
-        .set("Accept", "application/json")
-        .send_bytes(&body)
-        .map_err(|error| {
-            match error {
+        let response = ureq::post(&url)
+            .timeout(KEYSERVER_TIMEOUT)
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .set("Accept", "application/json")
+            .send_bytes(&body)
+            .map_err(|error| match error {
                 ureq::Error::Status(code, response) => {
                     let mut message = String::new();
 
@@ -396,21 +461,20 @@ fn upload_keyserver_key(
                 ureq::Error::Transport(error) => {
                     format!("Keyserver nicht erreichbar: {error}")
                 }
-            }
-        })?;
+            })?;
 
-    let mut response_body = String::new();
+        let mut response_body = String::new();
 
-    response
-        .into_reader()
-        .take(64 * 1024)
-        .read_to_string(&mut response_body)
-        .map_err(|e| format!("Serverantwort konnte nicht gelesen werden: {e}"))?;
+        response
+            .into_reader()
+            .take(64 * 1024)
+            .read_to_string(&mut response_body)
+            .map_err(|e| format!("Serverantwort konnte nicht gelesen werden: {e}"))?;
 
-    Ok(format!(
-        "Öffentlicher Schlüssel für {owner} erfolgreich hochgeladen."
-    ))
-}
+        Ok(format!(
+            "Öffentlicher Schlüssel für {owner} erfolgreich hochgeladen."
+        ))
+    }
 
     /// Legt einen öffentlichen Schlüssel im Benutzerordner ab und trägt ihn in
     /// die Schlüsselverwaltung ein.
@@ -419,6 +483,7 @@ fn upload_keyserver_key(
         label: &str,
         bytes: &[u8],
         method: Method,
+        kind: Option<PqcKeyKind>,
     ) -> Result<(), String> {
         let label = label.replace(['\t', '\r', '\n'], " ").trim().to_owned();
         if label.is_empty() {
@@ -447,7 +512,13 @@ fn upload_keyserver_key(
             .map_err(|error| format!("Schlüssel konnte nicht importiert werden: {error}"))?;
         let manifest = directory.join("recipients.tsv");
         let mut contents = fs::read_to_string(&manifest).unwrap_or_default();
-        contents.push_str(&format!("{}\t{}\t{}\n", method.tag(), label, file_name));
+        contents.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            method.tag(),
+            pqc_kind_tag(kind),
+            label,
+            file_name
+        ));
         if let Err(error) = fs::write(&manifest, contents) {
             let _ = fs::remove_file(&destination);
             return Err(format!(
@@ -458,6 +529,7 @@ fn upload_keyserver_key(
             label: label.clone(),
             path: destination.clone(),
             method,
+            kind,
         });
         self.key = Some(destination);
         Ok(())
@@ -561,7 +633,7 @@ fn upload_keyserver_key(
                     match result {
                         Ok(bytes) => match detect_key_method_bytes(&bytes) {
                             Some(Method::Pgp) => {
-                                match self.store_recipient_key(&label, &bytes, Method::Pgp) {
+                                match self.store_recipient_key(&label, &bytes, Method::Pgp, None) {
                                     Ok(()) => {
                                         self.keyserver_status =
                                             format!("Schlüssel für {label} importiert.");
@@ -587,21 +659,21 @@ fn upload_keyserver_key(
                     }
                 }
                 KeyserverEvent::Uploaded(result) => {
-    self.keyserver_loading = false;
+                    self.keyserver_loading = false;
 
-    match result {
-        Ok(message) => {
-            self.keyserver_owner.clear();
-            self.keyserver_upload_path = None;
-            self.keyserver_status = message;
+                    match result {
+                        Ok(message) => {
+                            self.keyserver_owner.clear();
+                            self.keyserver_upload_path = None;
+                            self.keyserver_status = message;
 
-            self.load_keyserver_list();
-        }
-        Err(error) => {
-            self.keyserver_status = format!("Upload fehlgeschlagen: {error}");
-        }
-    }
-}
+                            self.load_keyserver_list();
+                        }
+                        Err(error) => {
+                            self.keyserver_status = format!("Upload fehlgeschlagen: {error}");
+                        }
+                    }
+                }
             }
         }
         if !received {
@@ -628,6 +700,11 @@ fn upload_keyserver_key(
         let Ok(source_bytes) = fs::read(&source) else {
             self.status = "Der geheime Schlüssel konnte nicht gelesen werden.".into();
             return;
+        };
+        let kind = if method == Method::Pqc {
+            secret_kind_from_name(&source)
+        } else {
+            None
         };
         if let Some(existing) = self.secret_keys.iter().find(|entry| {
             entry.method == method
@@ -669,7 +746,13 @@ fn upload_keyserver_key(
         };
         let manifest = directory.join("secret-keys.tsv");
         let mut contents = fs::read_to_string(&manifest).unwrap_or_default();
-        contents.push_str(&format!("{}\t{}\t{}\n", method.tag(), label, file_name));
+        contents.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            method.tag(),
+            pqc_kind_tag(kind),
+            label,
+            file_name
+        ));
         if let Err(error) = fs::write(&manifest, contents) {
             let _ = fs::remove_file(&destination);
             self.status = format!("Schlüsselverwaltung konnte nicht gespeichert werden: {error}");
@@ -679,6 +762,7 @@ fn upload_keyserver_key(
             label: label.clone(),
             path: destination.clone(),
             method,
+            kind,
         });
         self.key = Some(destination);
         self.secret_label.clear();
@@ -691,7 +775,9 @@ fn upload_keyserver_key(
         }
         // Öffentliche und geheime Schlüssel sind nicht austauschbar. Beim
         // Wechsel der Schlüsselrolle darf keine falsche Auswahl stehen bleiben.
-        if self.op.uses_secret_key() != op.uses_secret_key() {
+        if self.op.uses_secret_key() != op.uses_secret_key()
+            || required_pqc_key_kind(self.method, self.op) != required_pqc_key_kind(self.method, op)
+        {
             self.key = None;
         }
         self.op = op;
@@ -738,7 +824,7 @@ fn upload_keyserver_key(
     }
 
     fn generate_keys(&mut self) {
-        if self.user_id.trim().is_empty() {
+        if self.method == Method::Pgp && self.user_id.trim().is_empty() {
             self.status = "Bitte eine Nutzerkennung eingeben.".into();
             return;
         }
@@ -750,57 +836,95 @@ fn upload_keyserver_key(
             self.status = "Die Passphrasen stimmen nicht überein.".into();
             return;
         }
-        let (secret_name, public_name) = match self.method {
-            Method::Pgp => ("schluessel.sec.asc", "schluessel.pub.asc"),
-            Method::Pqc => ("schluessel.sec.pqc", "schluessel.pub.pqc"),
-            Method::Ctx => return,
-        };
-        let Some(secret_out) = rfd::FileDialog::new()
-            .set_file_name(secret_name)
-            .save_file()
-        else {
-            return;
-        };
-        let Some(public_out) = rfd::FileDialog::new()
-            .set_file_name(public_name)
-            .save_file()
-        else {
-            return;
-        };
-        if secret_out == public_out {
-            self.status = "Geheimer und öffentlicher Schlüssel benötigen getrennte Dateien.".into();
-            return;
-        }
+
+        let method = self.method;
         let mut password = std::mem::take(&mut self.password);
         self.password_confirm.zeroize();
         let passphrase = SecretString::new(std::mem::take(&mut password));
         password.zeroize();
-        let user_id = self.user_id.trim().to_owned();
-        let method = self.method;
-        self.running = true;
-        self.status = "Schlüsselpaar wird erzeugt …".into();
+
         let (tx, rx) = mpsc::channel();
         self.events = Some(rx);
-        thread::spawn(move || {
-            let result = match method {
-                Method::Pgp => {
-                    pgp_generate_key(&user_id, passphrase, &secret_out, &public_out, false)
+        self.running = true;
+
+        match method {
+            Method::Pgp => {
+                let (secret_name, public_name) = ("schluessel.sec.asc", "schluessel.pub.asc");
+                let Some(secret_out) = rfd::FileDialog::new()
+                    .set_file_name(secret_name)
+                    .save_file()
+                else {
+                    self.running = false;
+                    return;
+                };
+                let Some(public_out) = rfd::FileDialog::new()
+                    .set_file_name(public_name)
+                    .save_file()
+                else {
+                    self.running = false;
+                    return;
+                };
+                if secret_out == public_out {
+                    self.status =
+                        "Geheimer und öffentlicher Schlüssel benötigen getrennte Dateien.".into();
+                    self.running = false;
+                    return;
                 }
-                Method::Pqc => {
-                    pqc_generate_key(&user_id, passphrase, &secret_out, &public_out, false)
-                }
-                Method::Ctx => unreachable!("CTX erzeugt keine Schlüsselpaare"),
+                let user_id = self.user_id.trim().to_owned();
+                self.status = "Schlüsselpaar wird erzeugt …".into();
+                thread::spawn(move || {
+                    let result =
+                        pgp_generate_key(&user_id, passphrase, &secret_out, &public_out, false)
+                            .map(|()| {
+                                format!(
+                                    "Schlüsselpaar erstellt: {} und {}",
+                                    public_out.display(),
+                                    secret_out.display()
+                                )
+                            })
+                            .map_err(|error| error.to_string());
+                    let _ = tx.send(Event::Finished(result));
+                });
             }
-            .map(|()| {
-                format!(
-                    "Schlüsselpaar erstellt: {} und {}",
-                    public_out.display(),
-                    secret_out.display()
-                )
-            })
-            .map_err(|error| error.to_string());
-            let _ = tx.send(Event::Finished(result));
-        });
+            Method::Pqc => {
+                let Some(directory) = rfd::FileDialog::new().pick_folder() else {
+                    self.running = false;
+                    return;
+                };
+                // Cryptool verwendet für PQC-Schlüssel wie bei OpenPGP
+                // ausschließlich PEM-Dateien. DER bleibt als Importformat
+                // in der Bibliothek unterstützt.
+                let format = PqcKeyFormat::Pem;
+                let kem_secret = directory.join("schluessel-kem.sec.pem");
+                let kem_public = directory.join("schluessel-kem.pub.pem");
+                let dsa_secret = directory.join("schluessel-dsa.sec.pem");
+                let dsa_public = directory.join("schluessel-dsa.pub.pem");
+                self.status = "ML-KEM- und ML-DSA-Schlüssel werden erzeugt …".into();
+                thread::spawn(move || {
+                    let result = pqc_generate_key(
+                        passphrase,
+                        &kem_secret,
+                        &kem_public,
+                        &dsa_secret,
+                        &dsa_public,
+                        format,
+                        false,
+                    )
+                    .map(|()| {
+                        format!(
+                            "Schlüssel erstellt in {}: ML-KEM und ML-DSA (geheim + öffentlich)",
+                            directory.display()
+                        )
+                    })
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(Event::Finished(result));
+                });
+            }
+            Method::Ctx => {
+                self.running = false;
+                return;
+            }
+        }
     }
 
     fn start(&mut self) {
@@ -929,33 +1053,33 @@ fn upload_keyserver_key(
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
-    self.poll_keyserver_events();
+        self.poll_keyserver_events();
 
-    if let Some(events) = &self.events {
-        while let Ok(event) = events.try_recv() {
-            match event {
-                Event::Progress(progress) => self.progress = Some(progress),
-                Event::Finished(result) => {
-                    self.running = false;
-                    self.cancel = None;
-                    if self.method.key_based() && self.text_mode {
-                        match result {
-                            Ok(output) => {
-                                self.text_output = output;
-                                self.status = "Text verarbeitet.".into();
+        if let Some(events) = &self.events {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    Event::Progress(progress) => self.progress = Some(progress),
+                    Event::Finished(result) => {
+                        self.running = false;
+                        self.cancel = None;
+                        if self.method.key_based() && self.text_mode {
+                            match result {
+                                Ok(output) => {
+                                    self.text_output = output;
+                                    self.status = "Text verarbeitet.".into();
+                                }
+                                Err(error) => self.status = format!("Fehler: {error}"),
                             }
-                            Err(error) => self.status = format!("Fehler: {error}"),
+                        } else {
+                            self.status = result.unwrap_or_else(|error| format!("Fehler: {error}"));
                         }
-                    } else {
-                        self.status = result.unwrap_or_else(|error| format!("Fehler: {error}"));
                     }
                 }
+                ctx.request_repaint();
             }
-             ctx.request_repaint();
         }
-    }
 
-         if self.running || self.keyserver_loading {
+        if self.running || self.keyserver_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1463,12 +1587,23 @@ impl eframe::App for CryptoolApp {
                                         ui.separator();
                                         ui.add_space(10.0);
 
-                                        if self.method.key_based() && self.keygen {
+                                        if self.method == Method::Pgp && self.keygen {
                                             ui.label("Nutzerkennung (Name und optional E-Mail)");
                                             ui.add(
                                                 egui::TextEdit::singleline(&mut self.user_id)
                                                     .hint_text("Anna Beispiel <anna@example.org>")
                                                     .desired_width(f32::INFINITY),
+                                            );
+                                        }
+
+                                        if self.method == Method::Pqc && self.keygen {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Es werden vier Schlüsseldateien erzeugt: \
+                                                     ML-KEM und ML-DSA, jeweils geheim und öffentlich.",
+                                                )
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(105, 117, 130)),
                                             );
                                         }
 
@@ -1485,10 +1620,17 @@ impl eframe::App for CryptoolApp {
                                                     self.method.label()
                                                 ));
                                                 if !self.recipients.is_empty() {
+                                                    let required = required_pqc_key_kind(
+                                                        self.method, self.op,
+                                                    );
                                                     let candidates: Vec<&RecipientKey> = self
                                                         .recipients
                                                         .iter()
                                                         .filter(|entry| entry.method == self.method)
+                                                        .filter(|entry| {
+                                                            entry.kind.is_none()
+                                                                || entry.kind == required
+                                                        })
                                                         .collect();
                                                     if candidates.is_empty() {
                                                         ui.label(
@@ -1563,10 +1705,17 @@ impl eframe::App for CryptoolApp {
                                                     }
                                                     _ => "Geheimer Schlüssel",
                                                 });
+                                                let required = required_pqc_key_kind(
+                                                    self.method, self.op,
+                                                );
                                                 let candidates: Vec<SecretKey> = self
                                                     .secret_keys
                                                     .iter()
                                                     .filter(|entry| entry.method == self.method)
+                                                    .filter(|entry| {
+                                                        entry.kind.is_none()
+                                                            || entry.kind == required
+                                                    })
                                                     .cloned()
                                                     .collect();
                                                 if candidates.is_empty() {
@@ -1876,7 +2025,11 @@ egui::Frame::new()
                                                 );
                                             });
                                         } else {
-                                            let action = if self.method.key_based() && self.keygen {
+                                            let action = if self.method == Method::Pqc
+                                                && self.keygen
+                                            {
+                                                "PQC-Schlüssel erstellen"
+                                            } else if self.method.key_based() && self.keygen {
                                                 "Schlüsselpaar erstellen"
                                             } else {
                                                 self.op.action()
@@ -2402,7 +2555,6 @@ fn parse_keyserver_list(html: &str) -> Vec<KeyserverEntry> {
             continue;
         };
 
-        
         // ID | Kennung | Dateiname | Download
         let owner = cells[1].clone();
         let filename = if cells[2] == "-" {
@@ -2410,9 +2562,17 @@ fn parse_keyserver_list(html: &str) -> Vec<KeyserverEntry> {
         } else {
             cells[2].clone()
         };
-        let filename = if filename == "-" { String::new() } else { filename };
+        let filename = if filename == "-" {
+            String::new()
+        } else {
+            filename
+        };
 
-        entries.push(KeyserverEntry { id, owner, filename });
+        entries.push(KeyserverEntry {
+            id,
+            owner,
+            filename,
+        });
     }
     entries
 }
@@ -2447,18 +2607,27 @@ fn detect_key_method_bytes(bytes: &[u8]) -> Option<Method> {
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(bytes.len());
     let bytes = &bytes[start..];
+    if bytes.starts_with(b"-----BEGIN PGP ") {
+        return Some(Method::Pgp);
+    }
+    // Standardisierte PQC-Schlüssel: SPKI (`PUBLIC KEY`) bzw. PKCS#8
+    // (`PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`) als PEM oder DER. Der
+    // Algorithmus (ML-KEM/ML-DSA) steht in der OID und wird beim Import
+    // gesondert bestimmt.
     if bytes.starts_with(b"-----BEGIN CRYPTOOL PQC ")
         || bytes.starts_with(b"CTPK")
         || bytes.starts_with(b"CTSK")
+        || bytes.starts_with(b"-----BEGIN PUBLIC KEY-----")
+        || bytes.starts_with(b"-----BEGIN PRIVATE KEY-----")
+        || bytes.starts_with(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        || bytes.first() == Some(&0x30)
     {
-        Some(Method::Pqc)
-    } else if bytes.starts_with(b"-----BEGIN PGP ")
-        || bytes.first().is_some_and(|byte| byte & 0x80 != 0)
-    {
-        Some(Method::Pgp)
-    } else {
-        None
+        return Some(Method::Pqc);
     }
+    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return Some(Method::Pgp);
+    }
+    None
 }
 
 fn detect_key_method(path: &Path) -> Option<Method> {
@@ -2483,16 +2652,24 @@ fn load_recipient_keys() -> Vec<RecipientKey> {
     let mut recipients = Vec::new();
     for line in contents.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
-        let (method, label, file_name) = match parts.as_slice() {
+        let (method, kind_tag, label, file_name) = match parts.as_slice() {
+            // Neues Format: Verfahren, Schlüsselart (kem/dsa/-), Name, Datei.
+            [tag, kind, label, file_name] => {
+                let Some(method) = method_from_tag(tag) else {
+                    continue;
+                };
+                (Some(method), *kind, *label, *file_name)
+            }
+            // Früheres Format ohne Schlüsselart.
             [tag, label, file_name] => {
                 let Some(method) = method_from_tag(tag) else {
                     continue;
                 };
-                (Some(method), *label, *file_name)
+                (Some(method), "-", *label, *file_name)
             }
             // Altes Format ohne Verfahren: anhand des Schlüsseldatei-Inhalts
             // zuordnen; alte Einträge waren in der Regel OpenPGP.
-            [label, file_name] => (None, *label, *file_name),
+            [label, file_name] => (None, "-", *label, *file_name),
             _ => continue,
         };
         let file_name = PathBuf::from(file_name);
@@ -2506,10 +2683,22 @@ fn load_recipient_keys() -> Vec<RecipientKey> {
         let Some(method) = method.or_else(|| detect_key_method(&path)) else {
             continue;
         };
+        // Bei PQC-Schlüsseln steckt die Unterart in der OID. Ältere Einträge
+        // haben keine Angabe; dann wird sie aus der Datei nachbestimmt.
+        let kind = if method == Method::Pqc {
+            pqc_kind_from_tag(kind_tag).or_else(|| {
+                let bytes = fs::read(&path).ok()?;
+                pqc_detect_public_key_kind(&bytes).ok()
+            })
+        } else {
+            None
+        };
+        let kind = kind.filter(|kind| kind.is_public());
         recipients.push(RecipientKey {
             label: label.to_owned(),
             path,
             method,
+            kind,
         });
     }
     recipients
@@ -2525,11 +2714,20 @@ fn load_secret_keys() -> Vec<SecretKey> {
     let mut keys = Vec::new();
     for line in contents.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
-        let [tag, label, file_name] = parts.as_slice() else {
-            continue;
-        };
-        let Some(method) = method_from_tag(tag) else {
-            continue;
+        let (method, kind_tag, label, file_name) = match parts.as_slice() {
+            [tag, kind, label, file_name] => {
+                let Some(method) = method_from_tag(tag) else {
+                    continue;
+                };
+                (method, *kind, *label, *file_name)
+            }
+            [tag, label, file_name] => {
+                let Some(method) = method_from_tag(tag) else {
+                    continue;
+                };
+                (method, "-", *label, *file_name)
+            }
+            _ => continue,
         };
         let file_name = PathBuf::from(file_name);
         if file_name.components().count() != 1 {
@@ -2539,10 +2737,20 @@ fn load_secret_keys() -> Vec<SecretKey> {
         if !path.is_file() {
             continue;
         }
+        // Verschlüsselte PKCS#8-Dateien verraten ihre Unterart erst nach dem
+        // Entschlüsseln; daher wird die gespeicherte Angabe bzw. der Dateiname
+        // verwendet.
+        let kind = if method == Method::Pqc {
+            secret_kind_from_tag(kind_tag).or_else(|| secret_kind_from_name(&path))
+        } else {
+            None
+        };
+        let kind = kind.filter(|kind| kind.is_secret());
         keys.push(SecretKey {
             label: (*label).to_owned(),
             path,
             method,
+            kind,
         });
     }
     keys
@@ -2724,7 +2932,7 @@ fn default_signature(input: &Path, method: Method) -> PathBuf {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([830.0, 850.0])
+            .with_inner_size([980.0, 950.0])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_maximized(false)
@@ -2746,29 +2954,26 @@ mod tests {
     fn parses_keyserver_list() {
         let html = r#"
             <table>
-              <tr><th>ID</th><th>Vorname</th><th>Nachname</th><th>Dateiname</th></tr>
+              <tr><th>ID</th><th>Kennung</th><th>Dateiname</th><th>Download</th></tr>
               <tr>
                 <td>7</td>
-                <td>Anna &amp; Co</td>
-                <td>Beispiel</td>
+                <td>Anna &amp; Co Beispiel</td>
                 <td>anna.asc</td>
                 <td><a href="/download/7">Download</a></td>
               </tr>
-              <tr><td colspan="5" style="text-align:center;">Keine Keys vorhanden.</td></tr>
+              <tr><td colspan="4" style="text-align:center;">Keine Keys vorhanden.</td></tr>
             </table>
         "#;
         let entries = parse_keyserver_list(html);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 7);
         assert_eq!(entries[0].owner, "Anna & Co Beispiel");
-        assert_eq!(entries[0].firstname, "Anna & Co");
-        assert_eq!(entries[0].lastname, "Beispiel");
         assert_eq!(entries[0].filename, "anna.asc");
     }
 
     #[test]
     fn parses_missing_filename_as_empty() {
-        let html = "<tr><td>1</td><td>Anna</td><td>Beispiel</td><td>-</td></tr>";
+        let html = "<tr><td>1</td><td>Anna</td><td>-</td></tr>";
         let entries = parse_keyserver_list(html);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].filename.is_empty());
@@ -2820,7 +3025,7 @@ mod tests {
                 request.starts_with("GET /list "),
                 "unerwartete Anfrage: {request}"
             );
-            let body = "<tr><td>7</td><td>Anna</td><td>Beispiel</td><td>anna.asc</td></tr>";
+            let body = "<tr><td>7</td><td>Anna</td><td>anna.asc</td></tr>";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -2831,7 +3036,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 7);
-        assert_eq!(entries[0].firstname, "Anna");
+        assert_eq!(entries[0].owner, "Anna");
     }
 
     #[test]

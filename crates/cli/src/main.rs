@@ -34,7 +34,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PgpCmd,
     },
-    /// PQC (ML-KEM-768): Schlüssel erzeugen und Nachrichten ver-/entschlüsseln
+    /// PQC (ML-KEM-768/ML-DSA-65): Schlüssel erzeugen und Nachrichten ver-/entschlüsseln
     Pqc {
         #[command(subcommand)]
         cmd: PqcCmd,
@@ -57,7 +57,7 @@ enum PgpCmd {
 
 #[derive(Subcommand)]
 enum PqcCmd {
-    /// ML-KEM-768/ML-DSA-65-Schlüsselpaar erzeugen
+    /// Getrennte ML-KEM-768- und ML-DSA-65-Schlüssel erzeugen
     Keygen(PqcKeygenArgs),
     /// Datei oder Ordner für einen Empfänger verschlüsseln
     Encrypt(PqcEncryptArgs),
@@ -224,14 +224,21 @@ struct PgpVerifyArgs {
 
 #[derive(Args)]
 struct PqcKeygenArgs {
-    /// Kennung für den Schlüssel, z. B. "Anna Beispiel <anna@example.com>"
-    user_id: String,
-    /// Datei für den geheimen Schlüssel (Standard: schluessel.sec.pqc)
-    #[arg(short, long, value_name = "DATEI")]
-    secret: Option<PathBuf>,
-    /// Datei für den öffentlichen Schlüssel (Standard: schluessel.pub.pqc)
-    #[arg(short = 'P', long, value_name = "DATEI")]
-    public: Option<PathBuf>,
+    /// Geheimer ML-KEM-Schlüssel (Standard: schluessel-kem.sec.pem)
+    #[arg(long, value_name = "DATEI")]
+    kem_secret: Option<PathBuf>,
+    /// Öffentlicher ML-KEM-Schlüssel (Standard: schluessel-kem.pub.pem)
+    #[arg(long, value_name = "DATEI")]
+    kem_public: Option<PathBuf>,
+    /// Geheimer ML-DSA-Schlüssel (Standard: schluessel-dsa.sec.pem)
+    #[arg(long, value_name = "DATEI")]
+    dsa_secret: Option<PathBuf>,
+    /// Öffentlicher ML-DSA-Schlüssel (Standard: schluessel-dsa.pub.pem)
+    #[arg(long, value_name = "DATEI")]
+    dsa_public: Option<PathBuf>,
+    /// Schlüssel als DER statt PEM schreiben
+    #[arg(long)]
+    der: bool,
     #[command(flatten)]
     password: PasswordArgs,
     /// Vorhandene Schlüsseldateien überschreiben
@@ -249,7 +256,7 @@ struct PqcEncryptArgs {
     /// Ziel (Standard: <eingabe>.pqc)
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Öffentlicher ML-KEM-Schlüssel des Empfängers (.pub.pqc oder binär)
+    /// Öffentlicher ML-KEM-Schlüssel des Empfängers (SPKI als PEM oder DER)
     #[arg(short = 'r', long, value_name = "DATEI")]
     recipient: PathBuf,
     /// Vorhandene Ausgabedatei überschreiben
@@ -267,7 +274,7 @@ struct PqcDecryptArgs {
     /// Ziel (Standard: ohne .pqc; bei Ordner-Nachrichten der Ordnername)
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Eigener geheimer Schlüssel (.sec.pqc oder binär)
+    /// Eigener geheimer ML-KEM-Schlüssel (verschlüsseltes PKCS#8 als PEM oder DER)
     #[arg(short = 'k', long, value_name = "DATEI")]
     key: PathBuf,
     #[command(flatten)]
@@ -287,7 +294,7 @@ struct PqcSignArgs {
     /// Signaturdatei (Standard: <eingabe>.pqc.sig bzw. <eingabe>.pqc.sig.asc)
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Eigener geheimer Schlüssel (.sec.pqc oder binär)
+    /// Eigener geheimer ML-DSA-Schlüssel (verschlüsseltes PKCS#8 als PEM oder DER)
     #[arg(short = 'k', long, value_name = "DATEI")]
     key: PathBuf,
     #[command(flatten)]
@@ -310,7 +317,7 @@ struct PqcVerifyArgs {
     /// Signaturdatei (Standard: <eingabe>.pqc.sig oder <eingabe>.pqc.sig.asc)
     #[arg(short = 's', long, value_name = "DATEI")]
     signature: Option<PathBuf>,
-    /// Öffentlicher Schlüssel des Unterzeichners (.pub.pqc oder binär)
+    /// Öffentlicher ML-DSA-Schlüssel des Unterzeichners (SPKI als PEM oder DER)
     #[arg(short = 'k', long, value_name = "DATEI")]
     key: PathBuf,
     /// Keine Fortschrittsanzeige und keine Hinweise
@@ -721,24 +728,46 @@ fn pqc_run(cmd: PqcCmd) -> ct::Result<()> {
 }
 
 fn pqc_keygen(a: PqcKeygenArgs) -> ct::Result<()> {
-    let secret_out = a
-        .secret
+    let extension = if a.der { "der" } else { "pem" };
+    let kem_secret = a
+        .kem_secret
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("schluessel.{}", ct::PQC_SECRET_KEY_EXTENSION)));
-    let public_out = a
-        .public
+        .unwrap_or_else(|| PathBuf::from(format!("schluessel-kem.sec.{extension}")));
+    let kem_public = a
+        .kem_public
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("schluessel.{}", ct::PQC_PUBLIC_KEY_EXTENSION)));
+        .unwrap_or_else(|| PathBuf::from(format!("schluessel-kem.pub.{extension}")));
+    let dsa_secret = a
+        .dsa_secret
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("schluessel-dsa.sec.{extension}")));
+    let dsa_public = a
+        .dsa_public
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("schluessel-dsa.pub.{extension}")));
+    let format = if a.der {
+        ct::PqcKeyFormat::Der
+    } else {
+        ct::PqcKeyFormat::Pem
+    };
 
     let passphrase = a.password.read(true)?;
-    ct::pqc_generate_key(&a.user_id, passphrase, &secret_out, &public_out, a.force)?;
+    ct::pqc_generate_key(
+        passphrase,
+        &kem_secret,
+        &kem_public,
+        &dsa_secret,
+        &dsa_public,
+        format,
+        a.force,
+    )?;
     if !a.quiet {
-        eprintln!("Geheimer Schlüssel   : {}", secret_out.display());
-        eprintln!("Öffentlicher Schlüssel: {}", public_out.display());
+        eprintln!("ML-KEM geheim    : {}", kem_secret.display());
+        eprintln!("ML-KEM öffentlich: {}", kem_public.display());
+        eprintln!("ML-DSA geheim    : {}", dsa_secret.display());
+        eprintln!("ML-DSA öffentlich: {}", dsa_public.display());
         eprintln!(
-            "Hinweis: Nur {} weitergeben; {} sicher aufbewahren.",
-            public_out.display(),
-            secret_out.display()
+            "Hinweis: Nur die öffentlichen Schlüssel weitergeben; die geheimen Schlüssel sicher aufbewahren."
         );
     }
     Ok(())
@@ -858,7 +887,8 @@ fn pqc_verify(a: PqcVerifyArgs, cancel: &AtomicBool) -> ct::Result<()> {
 }
 
 /// Strg+C-Handler, der nur das Abbruch-Flag setzt.
-fn setup_cancel() -> Arc<AtomicBool> {    let cancel = Arc::new(AtomicBool::new(false));
+fn setup_cancel() -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
     {
         let c = Arc::clone(&cancel);
         let _ = ctrlc::set_handler(move || c.store(true, Ordering::Relaxed));

@@ -22,11 +22,14 @@ pub use pgp::{
 };
 pub use pqc::{
     decrypt_path as pqc_decrypt_path, decrypt_text as pqc_decrypt_text,
-    encrypt_path as pqc_encrypt_path, encrypt_text as pqc_encrypt_text,
-    generate_key as pqc_generate_key, sign_path as pqc_sign_path, verify_path as pqc_verify_path,
-    PublicKey as PqcPublicKey, EXTENSION as PQC_EXTENSION,
-    PUBLIC_KEY_EXTENSION as PQC_PUBLIC_KEY_EXTENSION,
-    SECRET_KEY_EXTENSION as PQC_SECRET_KEY_EXTENSION,
+    detect_public_key_kind as pqc_detect_public_key_kind, encrypt_path as pqc_encrypt_path,
+    encrypt_text as pqc_encrypt_text, generate_key as pqc_generate_key, sign_path as pqc_sign_path,
+    verify_path as pqc_verify_path, KeyFormat as PqcKeyFormat, KeyKind as PqcKeyKind,
+    PublicKey as PqcPublicKey, VerifyingKey as PqcVerifyingKey,
+    DSA_PUBLIC_KEY_EXTENSION as PQC_DSA_PUBLIC_KEY_EXTENSION,
+    DSA_SECRET_KEY_EXTENSION as PQC_DSA_SECRET_KEY_EXTENSION, EXTENSION as PQC_EXTENSION,
+    KEM_PUBLIC_KEY_EXTENSION as PQC_KEM_PUBLIC_KEY_EXTENSION,
+    KEM_SECRET_KEY_EXTENSION as PQC_KEM_SECRET_KEY_EXTENSION,
     SIGNATURE_ARMOR_EXTENSION as PQC_SIGNATURE_ARMOR_EXTENSION,
     SIGNATURE_EXTENSION as PQC_SIGNATURE_EXTENSION, TEXT_EXTENSION as PQC_TEXT_EXTENSION,
 };
