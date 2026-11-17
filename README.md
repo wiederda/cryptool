@@ -68,10 +68,13 @@ Schlüsselserver importieren:
    **Abrufen** wählen.
 4. Eintrag auswählen und **In cryptool importieren**.
 
-Im selben Fenster kann der eigene öffentliche Schlüssel hochgeladen werden.
-Dazu Kennung (Name oder E-Mail-Adresse) und Schlüsseldatei wählen. OpenPGP- und
-PQC-Schlüssel werden anhand ihres Inhalts erkannt; geheime Schlüssel werden
-abgelehnt.
+Im selben Fenster kann ein eigener öffentlicher OpenPGP-Schlüssel hochgeladen
+werden. Dafür zuerst im Keyserver-Konto einen Upload-Token erstellen und ihn im
+Feld **Upload-Token** einfügen; danach die öffentliche Schlüsseldatei auswählen.
+Den Token erstellst du nach der Anmeldung im Dashboard unter **Cryptool Upload-Token**.
+Der Keyserver zeigt den Token nur einmal vollständig an. Cryptool hält ihn nur
+bis zum Schließen des Keyserver-Fensters im Arbeitsspeicher und sendet ihn nur
+über HTTPS an entfernte Keyserver. Geheime Schlüssel werden abgelehnt.
 
 Die zuletzt verwendete Adresse wird gespeichert und beim nächsten Start
 automatisch geladen:

@@ -36,8 +36,8 @@ use rand::thread_rng;
 use zeroize::Zeroize;
 
 use crate::engine::{
-    self, part_path, scan_dir, with_part_dir, with_part_file, Error, Progress, Report, Result,
-    Tracker, VerifyReport,
+    self, scan_dir, with_part_dir, with_part_file, Error, Progress, Report, Result, Tracker,
+    VerifyReport,
 };
 use crate::{ExposeSecret, SecretString};
 
@@ -180,23 +180,16 @@ pub fn generate_key(
     pw.zeroize();
     let public = secret.to_public_key();
 
-    let sec_part = part_path(secret_out);
-    {
-        let w = &mut BufWriter::new(File::create(&sec_part)?);
+    with_part_file(secret_out, force, |w| {
         secret
             .to_armored_writer(w, ArmorOptions::default())
-            .map_err(pgp_err)?;
-    }
-    fs::rename(&sec_part, secret_out)?;
-
-    let pub_part = part_path(public_out);
-    {
-        let w = &mut BufWriter::new(File::create(&pub_part)?);
+            .map_err(pgp_err)
+    })?;
+    with_part_file(public_out, force, |w| {
         public
             .to_armored_writer(w, ArmorOptions::default())
-            .map_err(pgp_err)?;
-    }
-    fs::rename(&pub_part, public_out)?;
+            .map_err(pgp_err)
+    })?;
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::fs;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,7 +17,7 @@ use cryptool_lib::{
     SecretString, VerifyReport,
 };
 use eframe::egui;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -253,7 +254,7 @@ struct CryptoolApp {
     keyserver_loading: bool,
     keyserver_events: Option<Receiver<KeyserverEvent>>,
     keyserver_upload_path: Option<PathBuf>,
-    keyserver_owner: String,
+    keyserver_upload_token: String,
 }
 
 impl Default for CryptoolApp {
@@ -290,7 +291,7 @@ impl Default for CryptoolApp {
             keyserver_loading: false,
             keyserver_events: None,
             keyserver_upload_path: None,
-            keyserver_owner: String::new(),
+            keyserver_upload_token: String::new(),
         }
     }
 }
@@ -347,10 +348,9 @@ impl CryptoolApp {
             return;
         }
 
-        let owner = self.keyserver_owner.trim().to_owned();
-
-        if owner.is_empty() || owner.contains(['\r', '\n']) {
-            self.keyserver_status = "Bitte eine gültige Kennung eingeben.".into();
+        let token = Zeroizing::new(self.keyserver_upload_token.trim().to_owned());
+        if token.is_empty() || token.contains(['\r', '\n']) {
+            self.keyserver_status = "Bitte den Upload-Token aus dem Keyserver eingeben.".into();
             return;
         }
 
@@ -373,12 +373,12 @@ impl CryptoolApp {
         self.keyserver_events = Some(rx);
 
         thread::spawn(move || {
-            let result = Self::upload_keyserver_key(&base, &owner, &path);
+            let result = Self::upload_keyserver_key(&base, token.as_str(), &path);
             let _ = tx.send(KeyserverEvent::Uploaded(result));
         });
     }
 
-    fn upload_keyserver_key(base: &str, owner: &str, path: &Path) -> Result<String, String> {
+    fn upload_keyserver_key(base: &str, token: &str, path: &Path) -> Result<String, String> {
         let metadata =
             fs::metadata(path).map_err(|e| format!("Datei konnte nicht gelesen werden: {e}"))?;
 
@@ -410,16 +410,6 @@ impl CryptoolApp {
 
         let mut body = Vec::new();
 
-        // Kennung
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"owner\"\r\n\r\n\
-             {owner}\r\n"
-            )
-            .as_bytes(),
-        );
-
         // Schlüsseldatei
         body.extend_from_slice(
             format!(
@@ -433,7 +423,7 @@ impl CryptoolApp {
         body.extend_from_slice(&bytes);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-        let url = format!("{base}/submit");
+        let url = format!("{base}/api/keys/pgp");
 
         let response = ureq::post(&url)
             .timeout(KEYSERVER_TIMEOUT)
@@ -442,6 +432,7 @@ impl CryptoolApp {
                 &format!("multipart/form-data; boundary={boundary}"),
             )
             .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {token}"))
             .send_bytes(&body)
             .map_err(|error| match error {
                 ureq::Error::Status(code, response) => {
@@ -471,9 +462,7 @@ impl CryptoolApp {
             .read_to_string(&mut response_body)
             .map_err(|e| format!("Serverantwort konnte nicht gelesen werden: {e}"))?;
 
-        Ok(format!(
-            "Öffentlicher Schlüssel für {owner} erfolgreich hochgeladen."
-        ))
+        Ok(format!("Öffentlicher Schlüssel erfolgreich hochgeladen."))
     }
 
     /// Legt einen öffentlichen Schlüssel im Benutzerordner ab und trägt ihn in
@@ -663,7 +652,6 @@ impl CryptoolApp {
 
                     match result {
                         Ok(message) => {
-                            self.keyserver_owner.clear();
                             self.keyserver_upload_path = None;
                             self.keyserver_status = message;
 
@@ -724,12 +712,30 @@ impl CryptoolApp {
             self.status = format!("Schlüsselordner konnte nicht angelegt werden: {error}");
             return;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
+                self.status = format!("Schlüsselordner konnte nicht geschützt werden: {error}");
+                return;
+            }
+        }
         let next_id = (1u64..)
             .find(|id| !directory.join(format!("secret-{id}.key")).exists())
             .unwrap_or(1);
         let file_name = format!("secret-{next_id}.key");
         let destination = directory.join(&file_name);
-        if let Err(error) = fs::write(&destination, &source_bytes) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = options
+            .open(&destination)
+            .and_then(|mut file| file.write_all(&source_bytes));
+        if let Err(error) = write_result {
             self.status = format!("Geheimer Schlüssel konnte nicht gespeichert werden: {error}");
             return;
         }
@@ -1395,10 +1401,11 @@ impl CryptoolApp {
                 // Upload
                 ui.add_space(8.0);
                 ui.separator();
-                ui.label("Eigenen öffentlichen Schlüssel hochladen");
+                ui.label("Öffentlichen Schlüssel mit Upload-Token hochladen");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.keyserver_owner)
-                        .hint_text("Name oder E-Mail-Adresse")
+                    egui::TextEdit::singleline(&mut self.keyserver_upload_token)
+                        .password(true)
+                        .hint_text("Upload-Token aus dem Keyserver")
                         .desired_width(f32::INFINITY),
                 );
                 ui.horizontal(|ui| {
@@ -1421,7 +1428,7 @@ impl CryptoolApp {
                     }
                 });
                 let can_upload = !self.keyserver_loading
-                    && !self.keyserver_owner.trim().is_empty()
+                    && !self.keyserver_upload_token.trim().is_empty()
                     && self.keyserver_upload_path.is_some();
                 if ui
                     .add_enabled(
@@ -1447,6 +1454,7 @@ impl CryptoolApp {
                 self.keyserver_url = url.clone();
                 save_keyserver_url(&url);
             }
+            self.keyserver_upload_token.zeroize();
             self.show_keyserver = false;
         }
     }
@@ -2490,11 +2498,46 @@ fn normalize_keyserver_url(input: &str) -> String {
         return String::new();
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+    let normalized = if lower.starts_with("http://") || lower.starts_with("https://") {
         trimmed.to_owned()
     } else {
         format!("http://{trimmed}")
+    };
+    if keyserver_url_allowed(&normalized) {
+        normalized
+    } else {
+        String::new()
     }
+}
+
+fn keyserver_url_allowed(url: &str) -> bool {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if scheme == "https" {
+        return true;
+    }
+    let host = if authority.starts_with('[') {
+        authority
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 fn fetch_keyserver_list(base: &str) -> Result<Vec<KeyserverEntry>, String> {

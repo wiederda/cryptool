@@ -25,7 +25,7 @@
 //! Struktur stehen also nur im verschlüsselten Teil.
 
 use std::cell::Cell;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -64,9 +64,9 @@ const KDF_T: u32 = 3;
 const KDF_P: u32 = 1;
 
 // Obergrenzen beim Entschlüsseln (Schutz vor bösartigen Headern)
-const MAX_M_KIB: u32 = 1024 * 1024; // 1 GiB
-const MAX_T: u32 = 10;
-const MAX_P: u32 = 16;
+const MAX_M_KIB: u32 = 256 * 1024; // 256 MiB, bounded against hostile headers
+const MAX_T: u32 = 6;
+const MAX_P: u32 = 4;
 const MIN_CHUNK: u32 = 1024;
 const MAX_CHUNK: u32 = 64 * 1024 * 1024;
 
@@ -311,8 +311,8 @@ where
     if output.exists() && !force {
         return Err(Error::OutputExists(output.to_path_buf()));
     }
-    let part = part_path(output);
-    let mut w = BufWriter::new(File::create(&part)?);
+    let (part, file) = create_unique_part_file(output)?;
+    let mut w = BufWriter::new(file);
     let res = (|| -> Result<()> {
         f(&mut w)?;
         w.flush()?;
@@ -322,7 +322,26 @@ where
     drop(w);
     match res {
         Ok(()) => {
-            fs::rename(&part, output)?;
+            let publish = if force {
+                fs::rename(&part, output).map_err(Error::Io)
+            } else {
+                // Hard-link publication is atomic and fails if the destination
+                // appeared after the initial existence check.
+                fs::hard_link(&part, output).map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        Error::OutputExists(output.to_path_buf())
+                    } else {
+                        Error::Io(error)
+                    }
+                })
+            };
+            if let Err(error) = publish {
+                let _ = fs::remove_file(&part);
+                return Err(error);
+            }
+            if !force {
+                fs::remove_file(&part)?;
+            }
             Ok(())
         }
         Err(e) => {
@@ -330,6 +349,37 @@ where
             Err(e)
         }
     }
+}
+
+fn create_unique_part_file(output: &Path) -> Result<(PathBuf, File)> {
+    use chacha20poly1305::aead::rand_core::RngCore;
+    for _ in 0..16 {
+        let mut random = [0u8; 12];
+        OsRng.fill_bytes(&mut random);
+        let suffix = random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let mut name = output.as_os_str().to_owned();
+        name.push(format!(".{}.part", suffix));
+        let path = PathBuf::from(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Err(Error::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "kein eindeutiger temporärer Dateiname verfügbar",
+    )))
 }
 
 /// Wie `with_part_file`, aber für einen Ordner. Vorhandene Ordner werden nie
