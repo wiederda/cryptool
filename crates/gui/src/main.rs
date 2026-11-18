@@ -865,7 +865,11 @@ impl CryptoolApp {
         }
         self.method = method;
         self.keygen = false;
-        self.text_mode = false;
+        if !method.key_based() {
+            self.text_mode = false;
+        }
+        self.text_input.clear();
+        self.text_output.clear();
         self.input = None;
         self.key = None;
         self.signature = None;
@@ -875,7 +879,21 @@ impl CryptoolApp {
         self.password.zeroize();
         self.password_confirm.zeroize();
         self.progress = None;
-        self.status = "Datei oder Ordner auswählen".into();
+        self.status = if method.key_based() && self.text_mode {
+            match self.op {
+                Op::Encrypt => "Text eingeben".into(),
+                Op::Decrypt => {
+                    format!("{}: Text zum Entschlüsseln einfügen", method.label())
+                }
+                Op::Sign => format!("{}: Datei zum Signieren auswählen", method.label()),
+                Op::Verify => format!(
+                    "{}: Datei und Signatur zum Prüfen auswählen",
+                    method.label()
+                ),
+            }
+        } else {
+            "Datei oder Ordner auswählen".into()
+        };
     }
 
     fn generate_keys(&mut self) {
