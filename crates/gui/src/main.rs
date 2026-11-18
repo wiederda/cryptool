@@ -1322,133 +1322,145 @@ impl CryptoolApp {
         });
     }
 
-    fn keyserver_window(&mut self, ctx: &egui::Context) {
+    fn keyserver_page(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
-        let mut open = true;
-        egui::Window::new("OpenPGP-Keyserver")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.set_max_width(560.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.set_max_width(620.0);
+            ui.heading("OpenPGP-Keyserver");
+            ui.label(
+                "Schlüssel vom Keyserver abrufen oder einen öffentlichen Schlüssel hochladen.",
+            );
+            ui.add_space(16.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(249, 250, 251))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(202, 209, 217),
+                ))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.set_max_width(560.0);
 
-                // Adresse + Abrufen
-                ui.label("Adresse des Keyservers");
-                ui.horizontal(|ui| {
-                    let address_width = (ui.available_width() - 96.0).max(160.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.keyserver_url)
-                            .hint_text("http://localhost:8080")
-                            .desired_width(address_width),
+                    // Adresse + Abrufen
+                    ui.label("Adresse des Keyservers");
+                    ui.horizontal(|ui| {
+                        let address_width = (ui.available_width() - 96.0).max(160.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.keyserver_url)
+                                .hint_text("http://localhost:8080")
+                                .desired_width(address_width),
+                        );
+                        if ui
+                            .add_enabled(!self.keyserver_loading, egui::Button::new("Abrufen"))
+                            .clicked()
+                        {
+                            self.load_keyserver_list();
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&self.keyserver_status)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(76, 88, 102)),
                     );
-                    if ui
-                        .add_enabled(!self.keyserver_loading, egui::Button::new("Abrufen"))
-                        .clicked()
-                    {
-                        self.load_keyserver_list();
-                    }
-                });
+                    ui.separator();
 
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(&self.keyserver_status)
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(76, 88, 102)),
-                );
-                ui.separator();
-
-                // Liste
-                if self.keyserver_entries.is_empty() {
-                    ui.label("Noch keine Schlüssel geladen.");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(220.0)
-                        .show(ui, |ui| {
-                            for index in 0..self.keyserver_entries.len() {
-                                let entry = &self.keyserver_entries[index];
-                                let text = if entry.filename.is_empty() {
-                                    format!("{} · ID {}", entry.owner, entry.id)
-                                } else {
-                                    format!(
-                                        "{} · {} · ID {}",
-                                        entry.owner, entry.filename, entry.id
-                                    )
-                                };
-                                let selected = self.keyserver_selected == Some(index);
-                                if ui.selectable_label(selected, text).clicked() {
-                                    self.keyserver_selected = Some(index);
+                    // Liste
+                    if self.keyserver_entries.is_empty() {
+                        ui.label("Noch keine Schlüssel geladen.");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for index in 0..self.keyserver_entries.len() {
+                                    let entry = &self.keyserver_entries[index];
+                                    let text = if entry.filename.is_empty() {
+                                        format!("{} · ID {}", entry.owner, entry.id)
+                                    } else {
+                                        format!(
+                                            "{} · {} · ID {}",
+                                            entry.owner, entry.filename, entry.id
+                                        )
+                                    };
+                                    let selected = self.keyserver_selected == Some(index);
+                                    if ui.selectable_label(selected, text).clicked() {
+                                        self.keyserver_selected = Some(index);
+                                    }
                                 }
+                            });
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let can_import =
+                            self.keyserver_selected.is_some() && !self.keyserver_loading;
+                        if ui
+                            .add_enabled(can_import, egui::Button::new("In cryptool importieren"))
+                            .clicked()
+                        {
+                            self.import_from_keyserver();
+                        }
+                        if self.keyserver_loading {
+                            ui.spinner();
+                        }
+                    });
+
+                    // Upload
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Öffentlichen Schlüssel hochladen").strong());
+                    ui.label("Token aus der Keyserver-Verwaltung hier einfügen:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.keyserver_upload_token)
+                            .password(true)
+                            .hint_text("Upload-Token hier einfügen")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.keyserver_loading,
+                                egui::Button::new("Schlüsseldatei auswählen"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("OpenPGP-Schlüssel", &["asc", "pgp", "gpg"])
+                                .pick_file()
+                            {
+                                self.keyserver_upload_path = Some(path);
                             }
-                        });
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let can_import = self.keyserver_selected.is_some() && !self.keyserver_loading;
-                    if ui
-                        .add_enabled(can_import, egui::Button::new("In cryptool importieren"))
-                        .clicked()
-                    {
-                        self.import_from_keyserver();
-                    }
-                    if self.keyserver_loading {
-                        ui.spinner();
-                    }
-                });
-
-                // Upload
-                ui.add_space(8.0);
-                ui.separator();
-                ui.label("Öffentlichen Schlüssel mit Upload-Token hochladen");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.keyserver_upload_token)
-                        .password(true)
-                        .hint_text("Upload-Token aus dem Keyserver")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
+                        }
+                        if let Some(path) = &self.keyserver_upload_path {
+                            ui.small(path.file_name().unwrap_or_default().to_string_lossy());
+                        }
+                    });
+                    let can_upload = !self.keyserver_loading
+                        && !self.keyserver_upload_token.trim().is_empty()
+                        && self.keyserver_upload_path.is_some();
                     if ui
                         .add_enabled(
-                            !self.keyserver_loading,
-                            egui::Button::new("Schlüsseldatei auswählen"),
+                            can_upload,
+                            egui::Button::new("Öffentlichen Schlüssel hochladen"),
                         )
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("OpenPGP-Schlüssel", &["asc", "pgp", "gpg"])
-                            .pick_file()
-                        {
-                            self.keyserver_upload_path = Some(path);
+                        self.upload_to_keyserver();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Schließen").clicked() {
+                            close = true;
                         }
-                    }
-                    if let Some(path) = &self.keyserver_upload_path {
-                        ui.small(path.file_name().unwrap_or_default().to_string_lossy());
-                    }
+                    });
                 });
-                let can_upload = !self.keyserver_loading
-                    && !self.keyserver_upload_token.trim().is_empty()
-                    && self.keyserver_upload_path.is_some();
-                if ui
-                    .add_enabled(
-                        can_upload,
-                        egui::Button::new("Öffentlichen Schlüssel hochladen"),
-                    )
-                    .clicked()
-                {
-                    self.upload_to_keyserver();
-                }
+        });
 
-                ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Schließen").clicked() {
-                        close = true;
-                    }
-                });
-            });
-
-        if close || !open {
+        if close {
             let url = normalize_keyserver_url(&self.keyserver_url);
             if !url.is_empty() {
                 self.keyserver_url = url.clone();
@@ -1539,6 +1551,9 @@ impl eframe::App for CryptoolApp {
                     .inner_margin(egui::Margin::same(0)),
             )
             .show(ui, |ui| {
+                if self.show_keyserver {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.keyserver_page(ui));
+                } else {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
@@ -2087,6 +2102,7 @@ egui::Frame::new()
                         );
                     });
                 });
+                }
             });
 
         if self.show_about {
@@ -2111,10 +2127,6 @@ egui::Frame::new()
             if close {
                 self.show_about = false;
             }
-        }
-
-        if self.show_keyserver {
-            self.keyserver_window(ui.ctx());
         }
     }
 }
