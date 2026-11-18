@@ -1931,10 +1931,24 @@ impl eframe::App for CryptoolApp {
                                             );
                                             if !self.text_output.is_empty() {
                                                 ui.add_space(10.0);
-                                                ui.label(if self.op == Op::Encrypt {
-                                                    "Verschlüsselter Text"
-                                                } else {
-                                                    "Entschlüsselter Text"
+                                                ui.horizontal(|ui| {
+                                                    ui.label(if self.op == Op::Encrypt {
+                                                        "Verschlüsselter Text"
+                                                    } else {
+                                                        "Entschlüsselter Text"
+                                                    });
+                                                    if self.op == Op::Encrypt
+                                                        && ui
+                                                            .small_button("⧉")
+                                                            .on_hover_text(
+                                                                "In Zwischenablage kopieren",
+                                                            )
+                                                            .clicked()
+                                                    {
+                                                        ui.ctx().copy_text(self.text_output.clone());
+                                                        self.status =
+                                                            "Verschlüsselter Text kopiert.".into();
+                                                    }
                                                 });
                                                 ui.add(
                                                     egui::TextEdit::multiline(&mut self.text_output)
