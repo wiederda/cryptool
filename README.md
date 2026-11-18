@@ -7,7 +7,7 @@ deinem Rechner. Die grafische Oberfläche unterstützt drei Verfahren:
 | --- | --- | --- |
 | **CTX** | Dateien und Ordner mit einem Passwort schützen | Passwort |
 | **OpenPGP** | Mit anderen OpenPGP-Programmen Schlüssel und Dateien austauschen | Öffentlicher und geheimer Schlüssel |
-| **PQC** | Verschlüsselung und Signaturen mit Post-Quantum-Schlüsseln ausprobieren | Öffentlicher und geheimer Schlüssel |
+| **PQC** | Verschlüsselung und Signaturen mit standardisierten Post-Quantum-Verfahren | Öffentlicher und geheimer Schlüssel |
 
 ![cryptool Oberfläche](Screenshot.png)
 
@@ -53,6 +53,13 @@ Du kannst ein Schlüsselpaar in cryptool erzeugen:
 
 Gib nur den **öffentlichen Schlüssel** weiter. Bewahre den geheimen Schlüssel und seine Passphrase sicher auf.
 
+### Schlüssel aus anderen Programmen
+
+- **OpenPGP:** Schlüssel aus anderen OpenPGP-Programmen lassen sich grundsätzlich verwenden, sofern Cryptool den darin verwendeten Schlüsseltyp und die Algorithmen unterstützt.
+- **PQC:** Cryptool unterstützt ML-KEM-768 und ML-DSA-65. Öffentliche Schlüssel müssen als standardisiertes SPKI in PEM oder DER vorliegen; geheime Schlüssel als PKCS#8 in PEM oder DER. Ältere Kyber-/Dilithium-Entwürfe, andere Parametergrößen oder rohe Schlüsselbytes sind nicht automatisch kompatibel.
+
+Dass ein Schlüssel kompatibel ist, bedeutet nicht automatisch, dass auch verschlüsselte Dateien oder Signaturen zwischen Programmen austauschbar sind. Cryptools PQC-Nachrichten- und Signaturformate sind eigene Formate.
+
 ## Schlüsselserver
 
 Über **Schlüssel → Keyserver** kannst du öffentliche OpenPGP- und PQC-Schlüssel abrufen. Wähle zuerst das gewünschte Verfahren aus; die Liste zeigt dann Schlüssel dieses Verfahrens an. Trage die Serveradresse ein und klicke auf **Abrufen**. Wähle anschließend einen Eintrag und importiere ihn.
@@ -71,6 +78,7 @@ Die zuletzt verwendete Serveradresse merkt sich cryptool für den nächsten Star
 
 - Die Ver- und Entschlüsselung läuft lokal. Eine Netzwerkverbindung wird nur verwendet, wenn du den optionalen Keyserver aufrufst.
 - OpenPGP ist für den Austausch mit OpenPGP-Programmen gedacht.
-- PQC ist ein eigenes cryptool-Format und nicht mit OpenPGP kompatibel. Prüfe vor dem Austausch, ob die andere Person ebenfalls cryptool mit PQC verwendet.
+- Cryptool verwendet **ML-KEM-768** (NIST FIPS 203) zur Verschlüsselung und **ML-DSA-65** (NIST FIPS 204) für Signaturen. Das sind veröffentlichte Standards, keine selbst entwickelten Algorithmen.
+- Die PQC-Schlüsseldateien verwenden standardisierte PEM/DER-Schlüsselformate. Das Nachrichten- und Signaturformat von cryptool ist jedoch cryptool-eigen und nicht OpenPGP-kompatibel. Andere Programme können die Algorithmen ebenfalls unterstützen, aber cryptool-Dateien nur lesen, wenn sie auch dieses Format unterstützen.
 - Bei PQC kann cryptool nicht selbst bestätigen, wem ein öffentlicher Schlüssel gehört. Vergleiche den Schlüssel über einen vertrauenswürdigen zweiten Kanal.
 - Beim Verschlüsseln eines Ordners sollte die Ausgabedatei außerhalb des zu verschlüsselnden Ordners liegen.

@@ -6,8 +6,6 @@ members = ["crates/core", "crates/lib", "crates/cli", "crates/gui"]
 version = "0.3.5"
 edition = "2021"
 rust-version = "1.88"
-# license = "..."      # hier deine Lizenz eintragen
-# repository = "https://github.com/<du>/cryptool"
 
 [profile.release]
 lto = true
