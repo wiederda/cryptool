@@ -2599,7 +2599,7 @@ fn parse_keyserver_list(html: &str) -> Vec<KeyserverEntry> {
             .filter_map(|cell| {
                 let start = cell.find('>')? + 1;
                 let end = cell.find("</td>")?;
-                Some(html_unescape(cell[start..end].trim()))
+                Some(html_unescape(strip_html_tags(&cell[start..end]).trim()))
             })
             .collect();
 
@@ -2641,6 +2641,22 @@ fn html_unescape(input: &str) -> String {
         .replace("&#x27;", "'")
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
+}
+
+/// Entfernt HTML-Markup aus Tabellenzellen, etwa wenn der Server die ID als
+/// Link (`<a href="/download/7">7</a>`) ausgibt.
+fn strip_html_tags(input: &str) -> String {
+    let mut text = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for character in input.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(character),
+            _ => {}
+        }
+    }
+    text
 }
 
 fn method_from_tag(tag: &str) -> Option<Method> {
