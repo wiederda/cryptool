@@ -837,6 +837,8 @@ impl CryptoolApp {
         if !op.is_text_allowed() {
             self.text_mode = false;
         }
+        self.text_input.clear();
+        self.text_output.clear();
         self.input = None;
         self.signature = None;
         self.password.zeroize();
