@@ -1954,13 +1954,12 @@ impl eframe::App for CryptoolApp {
                                                     } else {
                                                         "Entschlüsselter Text"
                                                     });
-                                                    if self.op == Op::Encrypt
-                                                        && ui
-                                                            .small_button("⧉")
-                                                            .on_hover_text(
-                                                                "In Zwischenablage kopieren",
-                                                            )
-                                                            .clicked()
+                                                    if ui
+                                                        .small_button("⧉")
+                                                        .on_hover_text(
+                                                            "In Zwischenablage kopieren",
+                                                        )
+                                                        .clicked()
                                                     {
                                                         ui.ctx().copy_text(self.text_output.clone());
                                                         self.clipboard_clear_at = Some(
@@ -1970,27 +1969,24 @@ impl eframe::App for CryptoolApp {
                                                         ui.ctx().request_repaint_after(
                                                             std::time::Duration::from_millis(250),
                                                         );
-                                                        self.status =
-                                                            "Verschlüsselter Text kopiert.".into();
+                                                        self.status = "Text kopiert; die Zwischenablage wird in 60 Sekunden geleert.".into();
                                                     }
                                                 });
-                                                if self.op == Op::Encrypt {
-                                                    if let Some(deadline) = self.clipboard_clear_at {
-                                                        let remaining = deadline
-                                                            .saturating_duration_since(
-                                                                std::time::Instant::now(),
-                                                            );
-                                                        ui.add(
-                                                            egui::ProgressBar::new(
-                                                                (remaining.as_secs_f32() / 60.0)
-                                                                    .clamp(0.0, 1.0),
-                                                            )
-                                                            .text(format!(
-                                                                "Zwischenablage wird in {} s geleert",
-                                                                remaining.as_secs_f64().ceil() as u64
-                                                            )),
+                                                if let Some(deadline) = self.clipboard_clear_at {
+                                                    let remaining = deadline
+                                                        .saturating_duration_since(
+                                                            std::time::Instant::now(),
                                                         );
-                                                    }
+                                                    ui.add(
+                                                        egui::ProgressBar::new(
+                                                            (remaining.as_secs_f32() / 60.0)
+                                                                .clamp(0.0, 1.0),
+                                                        )
+                                                        .text(format!(
+                                                            "Zwischenablage wird in {} s geleert",
+                                                            remaining.as_secs_f64().ceil() as u64
+                                                        )),
+                                                    );
                                                 }
                                                 ui.add(
                                                     egui::TextEdit::multiline(&mut self.text_output)
