@@ -1,351 +1,76 @@
 # cryptool
 
-cryptool verschlüsselt und entschlüsselt Dateien, Ordner und Text **lokal** auf
-deinem Rechner. Es gibt eine grafische Oberfläche (`cryptool`) und ein
-Kommandozeilenprogramm (`cryptool-cli`). Beide nutzen dieselbe Bibliothek.
+cryptool verschlüsselt und entschlüsselt Dateien, Ordner und Text direkt auf
+deinem Rechner. Die grafische Oberfläche unterstützt drei Verfahren:
 
-Es stehen drei Verfahren zur Auswahl:
-
-| Verfahren | Wofür? | Schlüssel nötig? |
+| Verfahren | Verwendung | Schlüssel oder Passwort |
 | --- | --- | --- |
-| **CTX** | Einfache Verschlüsselung mit einem Passwort | Nein |
-| **OpenPGP** | Verschlüsselung und Signaturen, kompatibel zu OpenPGP | Ja, öffentlich/privat |
-| **PQC** | Verschlüsselung und Signaturen mit Post-Quantum-Verfahren | Ja, öffentlich/privat |
+| **CTX** | Dateien und Ordner mit einem Passwort schützen | Passwort |
+| **OpenPGP** | Mit anderen OpenPGP-Programmen Schlüssel und Dateien austauschen | Öffentlicher und geheimer Schlüssel |
+| **PQC** | Verschlüsselung und Signaturen mit Post-Quantum-Schlüsseln ausprobieren | Öffentlicher und geheimer Schlüssel |
 
-> **Kurzentscheidung:** Nur ein Passwort verwenden? → CTX. Mit anderer
-> OpenPGP-Software austauschen? → OpenPGP. Post-Quantum-Schutz testen? → PQC.
+![cryptool Oberfläche](Screenshot.png)
 
-![cryptool GUI](Screenshot.png)
+## cryptool starten
 
----
+Lade die passende cryptool-Version von den [GitHub Releases](https://github.com/wiederda/cryptool/releases) herunter. Unter Windows kannst du das Archiv entpacken und `cryptool.exe` starten. Eine Installation ist nicht erforderlich.
 
-## Installation
+## Dateien und Ordner verschlüsseln
 
-Lade die aktuelle Version von den
-[GitHub Releases](https://github.com/wiederda/cryptool/releases) herunter.
-Unter Windows enthält das Archiv `cryptool.exe` für die Oberfläche und
-`cryptool-cli.exe` für die Kommandozeile. Eine Installation ist nicht nötig:
-Archiv entpacken und die gewünschte Anwendung starten.
+1. Wähle im Menüband das Verfahren **CTX**, **OpenPGP** oder **PQC**.
+2. Wähle den Vorgang **Verschlüsseln** oder **Entschlüsseln**.
+3. Öffne eine Datei oder – beim Verschlüsseln – einen Ordner.
+4. Wähle den passenden Schlüssel oder gib bei CTX ein Passwort ein.
+5. Klicke auf **Jetzt verschlüsseln** oder **Jetzt entschlüsseln**.
 
----
+Beim Verschlüsseln mit OpenPGP oder PQC brauchst du den **öffentlichen Schlüssel** der Person, die die Datei öffnen soll. Zum Entschlüsseln brauchst du deinen **geheimen Schlüssel** und gegebenenfalls dessen Passphrase. CTX verwendet ein Passwort, das du der empfangenden Person sicher mitteilen musst.
 
-## GUI verwenden
+Die Ausgabedatei wird neben der Eingabe angelegt. Vorhandene Dateien werden nicht stillschweigend überschrieben.
 
-### So gehst du vor
+## Text verschlüsseln und entschlüsseln
 
-1. **Verfahren wählen** – im Menüband unter „Verfahren“: CTX, OpenPGP oder PQC.
-2. **Vorgang wählen** – „Verschlüsseln“, „Entschlüsseln“, „Signieren“ oder
-   „Prüfen“.
-3. **Eingabe wählen** – Datei, Ordner oder (bei OpenPGP/PQC) Text.
-4. **Schlüssel bzw. Passwort** – je nach Vorgang:
-   - **Verschlüsseln:** öffentlicher Schlüssel des Empfängers
-   - **Entschlüsseln:** eigener geheimer Schlüssel
-   - **Signieren:** eigener geheimer Schlüssel
-   - **Prüfen:** öffentlicher Schlüssel des Unterzeichners + Signaturdatei
-   - **CTX:** nur ein Passwort
-5. **Starten** – Fortschritt wird angezeigt, „Abbrechen“ bricht sauber ab.
+OpenPGP und PQC können auch direkt mit Text arbeiten:
 
-### Schlüssel in der GUI
+1. Wähle **OpenPGP** oder **PQC**.
+2. Wähle im Menüband unter **Ansicht** die Option **Text**.
+3. Wähle **Verschlüsseln** oder **Entschlüsseln** und gib den Text in das obere Feld ein.
+4. Starte den Vorgang. Das Ergebnis erscheint darunter.
 
-Öffentliche Schlüssel importierst du direkt im Hauptfenster:
+Mit dem Kopier-Button neben dem Ergebnis kannst du es in die Zwischenablage übernehmen. cryptool leert die Zwischenablage nach 60 Sekunden automatisch. Beim Wechsel zwischen Verfahren oder Vorgängen werden die Textfelder geleert; die Ansicht **Text** bleibt beim Wechsel zwischen OpenPGP und PQC ausgewählt.
 
-1. Namen eingeben (z. B. „Anna“).
-2. Auf „Importieren“ klicken und die Schlüsseldatei auswählen.
-3. Der Schlüssel erscheint danach in der Auswahlliste.
+CTX bietet keinen Textmodus.
 
-Geheime Schlüssel werden genauso importiert, aber nur bei „Entschlüsseln“ und
-„Signieren“ angeboten. Sie werden lokal gemerkt und können beim nächsten Start
-wieder aus der Liste gewählt werden.
+## Schlüssel verwenden
 
-### Schlüssel vom Schlüsselserver laden und hochladen
+Öffentliche Schlüssel kannst du in der Schlüsselverwaltung über **Importieren** hinzufügen. Gib einen Namen ein und wähle die Schlüsseldatei aus. Geheime Schlüssel werden ebenfalls importiert und lokal gemerkt; sie erscheinen nur bei Vorgängen, für die sie gebraucht werden.
 
-Öffentliche OpenPGP- und PQC-Schlüssel lassen sich auch direkt aus einem
-Schlüsselserver importieren:
+Du kannst ein Schlüsselpaar in cryptool erzeugen:
 
-1. Verfahren **OpenPGP** oder **PQC** wählen.
-2. Im Menüband **Schlüssel** auf **Keyserver** klicken.
-3. Adresse des Keyservers eintragen (Standard: `http://localhost:8080`) und
-   **Abrufen** wählen.
-4. Eintrag auswählen und **In cryptool importieren**.
+1. Wähle **OpenPGP** oder **PQC**.
+2. Öffne im Menüband **Schlüssel** und wähle **Erstellen**.
+3. Gib die verlangten Angaben und eine Passphrase ein.
+4. Wähle Speicherorte für die Schlüsseldateien.
 
-Im selben Fenster kann ein eigener öffentlicher OpenPGP-Schlüssel hochgeladen
-werden. Dafür zuerst im Keyserver-Konto einen Upload-Token erstellen und ihn im
-Feld **Upload-Token** einfügen; danach die öffentliche Schlüsseldatei auswählen.
-Den Token erstellst du nach der Anmeldung im Dashboard unter **Cryptool Upload-Token**.
-Der Keyserver zeigt den Token nur einmal vollständig an. Cryptool hält ihn nur
-bis zum Schließen des Keyserver-Fensters im Arbeitsspeicher und sendet ihn nur
-über HTTPS an entfernte Keyserver. Geheime Schlüssel werden abgelehnt.
+Gib nur den **öffentlichen Schlüssel** weiter. Bewahre den geheimen Schlüssel und seine Passphrase sicher auf.
 
-Die zuletzt verwendete Adresse wird gespeichert und beim nächsten Start
-automatisch geladen:
+## Schlüsselserver
 
-```text
-%APPDATA%\cryptool\keyserver-url.txt
-```
+Über **Schlüssel → Keyserver** kannst du öffentliche OpenPGP- und PQC-Schlüssel abrufen. Wähle zuerst das gewünschte Verfahren aus; die Liste zeigt dann Schlüssel dieses Verfahrens an. Trage die Serveradresse ein und klicke auf **Abrufen**. Wähle anschließend einen Eintrag und importiere ihn.
 
-Die Umgebungsvariable `CRYPTOOL_KEYSERVER_URL` hat Vorrang vor der gespeicherten
-Adresse. Der Schlüsselserver muss die Routen `GET /list` und
-`GET /download/<id>` bereitstellen (z. B. der mitgelieferte `pgp-keyserver`).
-Beim Import wird der Schlüssel wie ein manuell importierter Empfängerschlüssel
-lokal gespeichert.
+Du kannst auf derselben Seite auch einen öffentlichen OpenPGP- oder PQC-Schlüssel hochladen. Dafür brauchst du einen Upload-Token aus der Verwaltung deines Keyservers. Füge den Token ein, wähle die öffentliche Schlüsseldatei und starte den Upload. Lade niemals einen geheimen Schlüssel hoch. Der Token wird nur vorübergehend in cryptool gespeichert und beim Verlassen der Keyserver-Seite gelöscht. Zu entfernten Keyservern sendet cryptool den Token nur über HTTPS.
 
-Ablageorte (Windows):
+Die zuletzt verwendete Serveradresse merkt sich cryptool für den nächsten Start. Wenn du keinen eigenen Server betreibst oder verwendest, kannst du diesen Bereich ignorieren.
 
-```text
-%APPDATA%\cryptool\recipient-keys\   öffentliche Empfängerschlüssel
-%APPDATA%\cryptool\secret-keys\      gemerkte geheime Schlüssel
-```
+## Signaturen
 
-Unter Linux/macOS liegen die Dateien im jeweiligen Benutzer-Konfigurationsordner
-unter `cryptool/`.
+- **Signieren** erstellt eine Signatur für eine einzelne Datei. Ordner können nicht signiert werden.
+- **Prüfen** benötigt die Originaldatei, die Signaturdatei und den öffentlichen Schlüssel der unterzeichnenden Person.
+- Öffentliche Schlüssel müssen über einen vertrauenswürdigen Weg bezogen und dem richtigen Besitzer zugeordnet werden.
 
-> Geheime Schlüssel bleiben durch ihre Passphrase geschützt. Schütze trotzdem
-> den Benutzerordner und gib geheime Schlüssel niemals weiter.
+## Wichtige Hinweise
 
-### Schlüsselpaar in der GUI erzeugen
-
-1. Verfahren **OpenPGP** oder **PQC** wählen.
-2. Menüband „Schlüssel“ → „Erstellen“.
-3. Nutzerkennung und Passphrase eingeben.
-4. Speicherort für den geheimen und den öffentlichen Schlüssel wählen.
-
-Danach kannst du den öffentlichen Schlüssel weitergeben und den geheimen
-Schlüssel zum Entschlüsseln oder Signieren importieren.
-
-### Textmodus
-
-Bei OpenPGP und PQC gibt es unter „Ansicht“ den Modus „Text“. Dort kannst du
-Text verschlüsseln oder entschlüsseln, ohne eine Datei anzulegen. Der
-verschlüsselte Text wird als ASCII-Armor ausgegeben und kann direkt wieder in
-das Textfeld eingefügt werden.
-
-CTX unterstützt keinen Textmodus.
-
-### Signieren und Prüfen
-
-- **Signieren** erzeugt eine abgetrennte Signaturdatei zur ausgewählten Datei.
-  Ordner werden nicht signiert.
-- **Prüfen** benötigt die Originaldatei, die Signaturdatei und den öffentlichen
-  Schlüssel des Unterzeichners.
-- Wenn keine Signaturdatei gewählt wird, sucht cryptool automatisch nach der
-  passenden Standarddatei (z. B. `brief.txt.sig`).
-
----
-
-## Kommandozeile: Grundlagen
-
-```text
-cryptool-cli --help
-cryptool-cli pgp --help
-cryptool-cli pqc --help
-```
-
-Allgemeine Optionen:
-
-| Option | Bedeutung |
-| --- | --- |
-| `-o`, `--output DATEI` | Zielpfad festlegen |
-| `-f`, `--force` | vorhandene Zieldatei überschreiben (Ordner nie) |
-| `-q`, `--quiet` | keine Fortschrittsanzeige und keine Hinweise |
-| `--armor` | ASCII-Armor statt Binärformat (nur OpenPGP/PQC) |
-
-### CTX: Dateien und Ordner mit Passwort
-
-```text
-cryptool-cli encrypt datei.txt
-cryptool-cli decrypt datei.txt.ctx
-
-cryptool-cli encrypt mein-ordner
-cryptool-cli decrypt mein-ordner.ctx
-
-cryptool-cli inspect mein-ordner.ctx
-```
-
-Standardziele:
-
-- Verschlüsseln: `<eingabe>.ctx`
-- Entschlüsseln: `<eingabe>` ohne `.ctx`
-- Ordner werden als tar-Archiv gepackt und mit zstd komprimiert.
-
-`inspect` zeigt den Header einer CTX-Datei an, ohne ein Passwort zu benötigen.
-
-### OpenPGP
-
-Schlüsselpaar erzeugen:
-
-```text
-cryptool-cli pgp keygen "Anna Beispiel <anna@example.org>"
-```
-
-Standarddateien:
-
-```text
-schluessel.sec.asc   geheimer Schlüssel (sicher aufbewahren)
-schluessel.pub.asc   öffentlicher Schlüssel (weitergeben)
-```
-
-Verschlüsseln und entschlüsseln:
-
-```text
-cryptool-cli pgp encrypt brief.txt --recipient anna.pub.asc
-cryptool-cli pgp decrypt brief.txt.pgp --key anna.sec.asc
-```
-
-Mit ASCII-Armor:
-
-```text
-cryptool-cli pgp encrypt brief.txt --recipient anna.pub.asc --armor
-```
-
-Signieren und prüfen:
-
-```text
-cryptool-cli pgp sign brief.txt --key anna.sec.asc
-cryptool-cli pgp verify brief.txt --key anna.pub.asc
-```
-
-Standarddateien:
-
-- Verschlüsseln: `<eingabe>.pgp` bzw. `<eingabe>.asc` mit `--armor`
-- Entschlüsseln: Datei ohne `.pgp`/`.asc`; Ordnerarchive werden entpackt
-- Signieren: `<eingabe>.sig` bzw. `<eingabe>.sig.asc` mit `--armor`
-- Prüfen: `<eingabe>.sig` oder `<eingabe>.sig.asc`
-
-### PQC (Post-Quantum)
-
-PQC verwendet ML-KEM-768 zur Schlüsseleinigung, HKDF-SHA256 zur
-Schlüsselableitung und XChaCha20-Poly1305 zur Verschlüsselung. Signaturen
-verwenden ML-DSA-65.
-
-Schlüsselpaar erzeugen:
-
-```text
-cryptool-cli pqc keygen "Anna Beispiel <anna@example.org>"
-```
-
-Standarddateien:
-
-```text
-schluessel.sec.pqc   geheimer Schlüssel
-schluessel.pub.pqc   öffentlicher Schlüssel
-```
-
-Verschlüsseln und entschlüsseln:
-
-```text
-cryptool-cli pqc encrypt brief.txt --recipient anna.pub.pqc
-cryptool-cli pqc decrypt brief.txt.pqc --key anna.sec.pqc
-```
-
-Signieren und prüfen:
-
-```text
-cryptool-cli pqc sign brief.txt --key anna.sec.pqc
-cryptool-cli pqc verify brief.txt --key anna.pub.pqc
-```
-
-Standarddateien:
-
-- Verschlüsseln: `<eingabe>.pqc`
-- Entschlüsseln: Datei ohne `.pqc`
-- Signieren: `<eingabe>.pqc.sig` bzw. `<eingabe>.pqc.sig.asc` mit `--armor`
-- Prüfen: `<eingabe>.pqc.sig` oder `<eingabe>.pqc.sig.asc`
-
-> **Wichtig:** Alte PQC-Schlüssel im Format v1 können verschlüsseln und
-> entschlüsseln, aber nicht signieren. Für Signaturen muss ein neues
-> Schlüsselpaar erzeugt werden.
-
----
-
-## Passwörter in Skripten
-
-Ohne Terminal fragt cryptool nicht interaktiv nach einem Passwort. Für Skripte
-gibt es deshalb:
-
-```text
-echo "mein-passwort" | cryptool-cli encrypt x.bin --password-stdin
-cryptool-cli encrypt x.bin --password-file passwort.txt
-cryptool-cli encrypt x.bin --no-confirm
-```
-
-- `--password-stdin` liest die erste Zeile aus stdin.
-- `--password-file DATEI` liest die erste Zeile aus einer Datei.
-- `--no-confirm` überspringt beim interaktiven Verschlüsseln die Wiederholung.
-- Beim Entschlüsseln und Signieren wird das Passwort nur einmal abgefragt.
-
-> Passwörter nie als Kommandozeilenargument übergeben: Sie sind dort für andere
-> Prozesse sichtbar.
-
-### Exit-Codes
-
-| Code | Bedeutung |
-| --- | --- |
-| `0` | erfolgreich |
-| `1` | allgemeiner Fehler |
-| `2` | Signatur ungültig |
-| `3` | falsches Passwort oder beschädigte Datei |
-| `130` | abgebrochen (z. B. Strg+C) |
-
----
-
-## Dateiendungen im Überblick
-
-| Verfahren | Verschlüsselt | Schlüssel | Signatur |
-| --- | --- | --- | --- |
-| CTX | `.ctx` | – | – |
-| OpenPGP | `.pgp`, `.asc` | `.pub.asc`, `.sec.asc` | `.sig`, `.sig.asc` |
-| PQC | `.pqc`, `.pqc.asc` | `.pub.pqc`, `.sec.pqc` | `.pqc.sig`, `.pqc.sig.asc` |
-
----
-
-## Hinweise zu Ordnern
-
-- Dateinamen und Ordnerstruktur stehen nur im verschlüsselten Teil.
-- Symlinks und Sonderdateien werden nicht aufgenommen; cryptool weist am Ende
-  darauf hin.
-- Besitzer und Gruppe werden nicht gespeichert, die Änderungszeit schon.
-- Die Zieldatei darf nicht im zu verschlüsselnden Ordner liegen.
-- Vorhandene Ordner werden beim Entschlüsseln nie überschrieben.
-
----
-
-## Sicherheit und Grenzen
-
-- cryptool arbeitet lokal. Nur der optionale Import und Upload über den
-  Schlüsselserver baut eine Netzwerkverbindung auf.
-- CTX nutzt Argon2id und XChaCha20-Poly1305.
-- OpenPGP nutzt Ed25519 zur Signatur, X25519 zum Verschlüsseln und
-  AES-256/OCB (SEIPD v2).
-- PQC ist ein eigenständiges, versioniertes Format (`CTPQ` v1) und **nicht**
-  RFC 9980. Es kombiniert genau ein KEM (ML-KEM-768) und ein DEM
-  (XChaCha20-Poly1305).
-- Bei PQC gibt es keine Selbstsignatur des Schlüssels. Die Echtheit eines
-  öffentlichen PQC-Schlüssels muss über einen separaten, vertrauenswürdigen
-  Kanal bestätigt werden.
-- Die OpenPGP-Implementierung sollte vor produktivem Einsatz mit unabhängigen
-  OpenPGP-Implementierungen und RFC-9580-Testfällen geprüft werden.
-
----
-
-## Probleme lösen
-
-| Meldung / Problem | Lösung |
-| --- | --- |
-| „Kein Terminal: Passwort bitte mit … übergeben“ | `--password-stdin` oder `--password-file` verwenden |
-| „Ziel existiert bereits“ | `-f` bzw. `--force` verwenden (Ordner werden nie überschrieben) |
-| Exit-Code `3` | Passwort prüfen oder Datei auf Beschädigung prüfen |
-| Exit-Code `2` | Signatur ist ungültig: Datei, Signatur und öffentlichen Schlüssel prüfen |
-| PQC-Signatur mit alter Schlüsseldatei | Neues PQC-Schlüsselpaar erzeugen (Format v2) |
-| Schlüssel wird in der GUI nicht angeboten | Prüfen, ob das richtige Verfahren gewählt ist und der Schlüssel importiert wurde |
-| Schlüssel passt nicht zum Verfahren | OpenPGP- und PQC-Schlüssel sind nicht austauschbar |
-
----
-
-## Projektstruktur
-
-```text
-crates/core   kryptografische Bausteine (Argon2id, XChaCha20-Poly1305)
-crates/lib    öffentliche API, Datei-/Ordnerabläufe, OpenPGP und PQC
-crates/cli    Kommandozeilenprogramm `cryptool-cli`
-crates/gui    Desktop-Oberfläche `cryptool` (egui)
-```
+- Die Ver- und Entschlüsselung läuft lokal. Eine Netzwerkverbindung wird nur verwendet, wenn du den optionalen Keyserver aufrufst.
+- OpenPGP ist für den Austausch mit OpenPGP-Programmen gedacht.
+- PQC ist ein eigenes cryptool-Format und nicht mit OpenPGP kompatibel. Prüfe vor dem Austausch, ob die andere Person ebenfalls cryptool mit PQC verwendet.
+- Bei PQC kann cryptool nicht selbst bestätigen, wem ein öffentlicher Schlüssel gehört. Vergleiche den Schlüssel über einen vertrauenswürdigen zweiten Kanal.
+- Beim Verschlüsseln eines Ordners sollte die Ausgabedatei außerhalb des zu verschlüsselnden Ordners liegen.
