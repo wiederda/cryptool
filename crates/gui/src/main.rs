@@ -236,6 +236,7 @@ struct CryptoolApp {
     text_mode: bool,
     text_input: String,
     text_output: String,
+    clipboard_clear_at: Option<std::time::Instant>,
     user_id: String,
     password: String,
     password_confirm: String,
@@ -273,6 +274,7 @@ impl Default for CryptoolApp {
             text_mode: false,
             text_input: String::new(),
             text_output: String::new(),
+            clipboard_clear_at: None,
             user_id: String::new(),
             password: String::new(),
             password_confirm: String::new(),
@@ -1127,6 +1129,7 @@ impl CryptoolApp {
 
     fn poll_events(&mut self, ctx: &egui::Context) {
         self.poll_keyserver_events();
+        self.poll_clipboard_clear(ctx);
 
         if let Some(events) = &self.events {
             while let Ok(event) = events.try_recv() {
@@ -1154,6 +1157,20 @@ impl CryptoolApp {
 
         if self.running || self.keyserver_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn poll_clipboard_clear(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.clipboard_clear_at else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            ctx.copy_text(String::new());
+            self.clipboard_clear_at = None;
+            self.status = "Zwischenablage geleert.".into();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 }
@@ -1946,10 +1963,35 @@ impl eframe::App for CryptoolApp {
                                                             .clicked()
                                                     {
                                                         ui.ctx().copy_text(self.text_output.clone());
+                                                        self.clipboard_clear_at = Some(
+                                                            std::time::Instant::now()
+                                                                + std::time::Duration::from_secs(60),
+                                                        );
+                                                        ui.ctx().request_repaint_after(
+                                                            std::time::Duration::from_millis(250),
+                                                        );
                                                         self.status =
                                                             "Verschlüsselter Text kopiert.".into();
                                                     }
                                                 });
+                                                if self.op == Op::Encrypt {
+                                                    if let Some(deadline) = self.clipboard_clear_at {
+                                                        let remaining = deadline
+                                                            .saturating_duration_since(
+                                                                std::time::Instant::now(),
+                                                            );
+                                                        ui.add(
+                                                            egui::ProgressBar::new(
+                                                                (remaining.as_secs_f32() / 60.0)
+                                                                    .clamp(0.0, 1.0),
+                                                            )
+                                                            .text(format!(
+                                                                "Zwischenablage wird in {} s geleert",
+                                                                remaining.as_secs_f64().ceil() as u64
+                                                            )),
+                                                        );
+                                                    }
+                                                }
                                                 ui.add(
                                                     egui::TextEdit::multiline(&mut self.text_output)
                                                         .desired_rows(7)
