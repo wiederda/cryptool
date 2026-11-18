@@ -149,6 +149,7 @@ struct KeyserverEntry {
     id: u64,
     owner: String,
     filename: String,
+    method: Option<Method>,
 }
 
 #[derive(Clone)]
@@ -360,6 +361,7 @@ impl CryptoolApp {
         };
 
         let base = normalize_keyserver_url(&self.keyserver_url);
+        let method = self.method;
 
         if base.is_empty() {
             self.keyserver_status = "Bitte die Keyserver-Adresse eingeben.".into();
@@ -373,12 +375,17 @@ impl CryptoolApp {
         self.keyserver_events = Some(rx);
 
         thread::spawn(move || {
-            let result = Self::upload_keyserver_key(&base, token.as_str(), &path);
+            let result = Self::upload_keyserver_key(&base, token.as_str(), &path, method);
             let _ = tx.send(KeyserverEvent::Uploaded(result));
         });
     }
 
-    fn upload_keyserver_key(base: &str, token: &str, path: &Path) -> Result<String, String> {
+    fn upload_keyserver_key(
+        base: &str,
+        token: &str,
+        path: &Path,
+        method: Method,
+    ) -> Result<String, String> {
         let metadata =
             fs::metadata(path).map_err(|e| format!("Datei konnte nicht gelesen werden: {e}"))?;
 
@@ -389,14 +396,31 @@ impl CryptoolApp {
         let bytes = fs::read(path)
             .map_err(|e| format!("Schlüsseldatei konnte nicht gelesen werden: {e}"))?;
 
-        if detect_key_method_bytes(&bytes) != Some(Method::Pgp) {
-            return Err("Die Datei enthält keinen gültigen OpenPGP-Schlüssel.".into());
+        match method {
+            Method::Pgp if detect_key_method_bytes(&bytes) != Some(Method::Pgp) => {
+                return Err("Die Datei enthält keinen gültigen OpenPGP-Schlüssel.".into());
+            }
+            Method::Pqc => match pqc_detect_public_key_kind(&bytes) {
+                Ok(PqcKeyKind::KemPublic | PqcKeyKind::DsaPublic) => {}
+                Ok(_) => return Err("Bitte einen öffentlichen PQC-Schlüssel auswählen.".into()),
+                Err(_) => {
+                    return Err(
+                        "Die Datei enthält keinen gültigen öffentlichen PQC-Schlüssel.".into(),
+                    )
+                }
+            },
+            Method::Ctx => return Err("Der Keyserver unterstützt CTX-Schlüssel nicht.".into()),
+            _ => {}
         }
 
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("public-key.asc")
+            .unwrap_or(if method == Method::Pqc {
+                "public-key.pem"
+            } else {
+                "public-key.asc"
+            })
             .replace(['"', '\r', '\n'], "_");
 
         let boundary = format!(
@@ -410,12 +434,18 @@ impl CryptoolApp {
 
         let mut body = Vec::new();
 
+        let (form_field, content_type) = match method {
+            Method::Pgp => ("pgpfile", "application/pgp-keys"),
+            Method::Pqc => ("pqcfile", "application/octet-stream"),
+            Method::Ctx => unreachable!("CTX-Schlüssel werden oben abgelehnt"),
+        };
+
         // Schlüsseldatei
         body.extend_from_slice(
             format!(
                 "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"pgpfile\"; filename=\"{filename}\"\r\n\
-             Content-Type: application/pgp-keys\r\n\r\n"
+             Content-Disposition: form-data; name=\"{form_field}\"; filename=\"{filename}\"\r\n\
+             Content-Type: {content_type}\r\n\r\n"
             )
             .as_bytes(),
         );
@@ -423,7 +453,7 @@ impl CryptoolApp {
         body.extend_from_slice(&bytes);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-        let url = format!("{base}/api/keys/pgp");
+        let url = format!("{base}/api/keys/{}", method.tag());
 
         let response = ureq::post(&url)
             .timeout(KEYSERVER_TIMEOUT)
@@ -462,7 +492,10 @@ impl CryptoolApp {
             .read_to_string(&mut response_body)
             .map_err(|e| format!("Serverantwort konnte nicht gelesen werden: {e}"))?;
 
-        Ok(format!("Öffentlicher Schlüssel erfolgreich hochgeladen."))
+        Ok(format!(
+            "{}-Schlüssel erfolgreich hochgeladen.",
+            method.label()
+        ))
     }
 
     /// Legt einen öffentlichen Schlüssel im Benutzerordner ab und trägt ihn in
@@ -526,9 +559,23 @@ impl CryptoolApp {
 
     fn open_keyserver(&mut self) {
         self.show_keyserver = true;
+        self.keyserver_selected = None;
         if self.keyserver_entries.is_empty() && self.keyserver_events.is_none() {
             self.load_keyserver_list();
         }
+    }
+
+    fn close_keyserver_page(&mut self) {
+        if !self.show_keyserver {
+            return;
+        }
+        let url = normalize_keyserver_url(&self.keyserver_url);
+        if !url.is_empty() {
+            self.keyserver_url = url.clone();
+            save_keyserver_url(&url);
+        }
+        self.keyserver_upload_token.zeroize();
+        self.show_keyserver = false;
     }
 
     fn load_keyserver_list(&mut self) {
@@ -620,30 +667,30 @@ impl CryptoolApp {
                 KeyserverEvent::Downloaded { label, result } => {
                     self.keyserver_loading = false;
                     match result {
-                        Ok(bytes) => match detect_key_method_bytes(&bytes) {
-                            Some(Method::Pgp) => {
-                                match self.store_recipient_key(&label, &bytes, Method::Pgp, None) {
-                                    Ok(()) => {
-                                        self.keyserver_status =
-                                            format!("Schlüssel für {label} importiert.");
-                                        self.status = self.keyserver_status.clone();
+                        Ok(bytes) => {
+                            let key = match detect_key_method_bytes(&bytes) {
+                                Some(Method::Pgp) => Some((Method::Pgp, None)),
+                                Some(Method::Pqc) => match pqc_detect_public_key_kind(&bytes) {
+                                    Ok(kind @ (PqcKeyKind::KemPublic | PqcKeyKind::DsaPublic)) => {
+                                        Some((Method::Pqc, Some(kind)))
                                     }
-                                    Err(error) => {
-                                        self.keyserver_status = format!("Fehler: {error}");
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            match key {
+                                Some((method, kind)) => {
+                                    match self.store_recipient_key(&label, &bytes, method, kind) {
+                                        Ok(()) => {
+                                            self.keyserver_status = format!("{}-Schlüssel für {label} importiert.", method.label());
+                                            self.status = self.keyserver_status.clone();
+                                        }
+                                        Err(error) => self.keyserver_status = format!("Fehler: {error}"),
                                     }
                                 }
+                                None => self.keyserver_status = "Der Keyserver hat keinen gültigen öffentlichen OpenPGP- oder PQC-Schlüssel geliefert.".into(),
                             }
-                            Some(method) => {
-                                self.keyserver_status = format!(
-                                    "Der Keyserver hat einen {}-Schlüssel geliefert.",
-                                    method.label()
-                                );
-                            }
-                            None => {
-                                self.keyserver_status =
-                                    "Die Antwort ist kein gültiger OpenPGP-Schlüssel.".into();
-                            }
-                        },
+                        }
                         Err(error) => self.keyserver_status = format!("Fehler: {error}"),
                     }
                 }
@@ -1284,6 +1331,7 @@ impl CryptoolApp {
             let create =
                 ribbon_button(ui, RibbonIcon::KeyPlus, "Erstellen", self.keygen, available);
             if create.clicked() {
+                self.close_keyserver_page();
                 self.keygen = true;
                 self.password.zeroize();
                 self.password_confirm.zeroize();
@@ -1292,6 +1340,7 @@ impl CryptoolApp {
             let process =
                 ribbon_button(ui, RibbonIcon::Mail, "Verarbeiten", !self.keygen, available);
             if process.clicked() {
+                self.close_keyserver_page();
                 self.keygen = false;
                 self.password.zeroize();
                 self.password_confirm.zeroize();
@@ -1300,7 +1349,7 @@ impl CryptoolApp {
         });
         ribbon_separator(ui);
         ribbon_group(ui, "Öffentlicher Schlüssel", |ui| {
-            let available = self.method == Method::Pgp && !self.running && !self.keygen;
+            let available = self.method.key_based() && !self.running && !self.keygen;
             if ribbon_button(ui, RibbonIcon::Server, "Keyserver", false, available).clicked() {
                 self.open_keyserver();
             }
@@ -1309,6 +1358,7 @@ impl CryptoolApp {
         ribbon_group(ui, "Geheimer Schlüssel", |ui| {
             let available = self.method.key_based() && self.op.uses_secret_key() && !self.running;
             if ribbon_button(ui, RibbonIcon::KeyOpen, "Öffnen", false, available).clicked() {
+                self.close_keyserver_page();
                 self.import_secret_key();
             }
         });
@@ -1327,7 +1377,7 @@ impl CryptoolApp {
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
             ui.set_max_width(620.0);
-            ui.heading("OpenPGP-Keyserver");
+            ui.heading("OpenPGP- und PQC-Keyserver");
             ui.label(
                 "Schlüssel vom Keyserver abrufen oder einen öffentlichen Schlüssel hochladen.",
             );
@@ -1372,11 +1422,24 @@ impl CryptoolApp {
                     if self.keyserver_entries.is_empty() {
                         ui.label("Noch keine Schlüssel geladen.");
                     } else {
+                        let visible_count = self
+                            .keyserver_entries
+                            .iter()
+                            .filter(|entry| keyserver_entry_matches_method(entry, self.method))
+                            .count();
+                        if visible_count == 0 {
+                            ui.label(format!(
+                                "Keine {}-Schlüssel in der Liste.",
+                                self.method.label()
+                            ));
+                        }
                         egui::ScrollArea::vertical()
                             .max_height(220.0)
                             .show(ui, |ui| {
-                                for index in 0..self.keyserver_entries.len() {
-                                    let entry = &self.keyserver_entries[index];
+                                for (index, entry) in self.keyserver_entries.iter().enumerate() {
+                                    if !keyserver_entry_matches_method(entry, self.method) {
+                                        continue;
+                                    }
                                     let text = if entry.filename.is_empty() {
                                         format!("{} · ID {}", entry.owner, entry.id)
                                     } else {
@@ -1411,7 +1474,13 @@ impl CryptoolApp {
                     // Upload
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Öffentlichen Schlüssel hochladen").strong());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Öffentlichen {}-Schlüssel hochladen",
+                            self.method.label()
+                        ))
+                        .strong(),
+                    );
                     ui.label("Token aus der Keyserver-Verwaltung hier einfügen:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.keyserver_upload_token)
@@ -1427,10 +1496,17 @@ impl CryptoolApp {
                             )
                             .clicked()
                         {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("OpenPGP-Schlüssel", &["asc", "pgp", "gpg"])
-                                .pick_file()
-                            {
+                            let dialog = rfd::FileDialog::new();
+                            let selected = if self.method == Method::Pqc {
+                                dialog
+                                    .add_filter("Öffentliche PQC-Schlüssel", &["pem", "pqc"])
+                                    .pick_file()
+                            } else {
+                                dialog
+                                    .add_filter("OpenPGP-Schlüssel", &["asc", "pgp", "gpg"])
+                                    .pick_file()
+                            };
+                            if let Some(path) = selected {
                                 self.keyserver_upload_path = Some(path);
                             }
                         }
@@ -1444,7 +1520,10 @@ impl CryptoolApp {
                     if ui
                         .add_enabled(
                             can_upload,
-                            egui::Button::new("Öffentlichen Schlüssel hochladen"),
+                            egui::Button::new(format!(
+                                "Öffentlichen {}-Schlüssel hochladen",
+                                self.method.label()
+                            )),
                         )
                         .clicked()
                     {
@@ -1461,13 +1540,7 @@ impl CryptoolApp {
         });
 
         if close {
-            let url = normalize_keyserver_url(&self.keyserver_url);
-            if !url.is_empty() {
-                self.keyserver_url = url.clone();
-                save_keyserver_url(&url);
-            }
-            self.keyserver_upload_token.zeroize();
-            self.show_keyserver = false;
+            self.close_keyserver_page();
         }
     }
 }
@@ -1518,6 +1591,7 @@ impl eframe::App for CryptoolApp {
                         (RibbonTab::Help, "Hilfe"),
                     ] {
                         if ribbon_tab(ui, self.ribbon_tab == tab, label).clicked() {
+                            self.close_keyserver_page();
                             self.ribbon_tab = tab;
                         }
                     }
@@ -2588,48 +2662,213 @@ fn fetch_keyserver_key(base: &str, id: u64) -> Result<Vec<u8>, String> {
 /// Liest die HTML-Tabelle von `/list`. Der Keyserver liefert bewusst nur HTML;
 /// deshalb werden die Zeilen und Zellen hier minimal ausgewertet.
 fn parse_keyserver_list(html: &str) -> Vec<KeyserverEntry> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<KeyserverEntry> = Vec::new();
 
-    for row in html.split("<tr").skip(1) {
-        let row = row.split("</tr>").next().unwrap_or(row);
-
-        let cells: Vec<String> = row
-            .split("<td")
-            .skip(1)
-            .filter_map(|cell| {
-                let start = cell.find('>')? + 1;
-                let end = cell.find("</td>")?;
-                Some(html_unescape(strip_html_tags(&cell[start..end]).trim()))
-            })
-            .collect();
-
-        if cells.len() < 3 {
-            continue;
+    let lower = html.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut offset = 0;
+    while let Some(start_rel) = rest.find("<tr") {
+        let start = offset + start_rel;
+        rest = &rest[start_rel + 3..];
+        offset = start + 3;
+        let Some(end_rel) = rest.find("</tr>") else {
+            break;
+        };
+        let end = offset + end_rel;
+        let row = &html[start..end];
+        let cells = parse_keyserver_cells(row);
+        let id_cell = cells.iter().position(|cell| cell.parse::<u64>().is_ok());
+        let id = id_cell
+            .and_then(|index| cells[index].parse::<u64>().ok())
+            .or_else(|| extract_keyserver_download_id(row));
+        if let Some(id) = id {
+            let data_start = id_cell.map_or(0, |index| index + 1);
+            let data: Vec<String> = cells[data_start..]
+                .iter()
+                .filter(|cell| {
+                    !cell.is_empty()
+                        && !cell.eq_ignore_ascii_case("download")
+                        && !is_keyserver_method_cell(cell)
+                })
+                .cloned()
+                .collect();
+            let owner = data
+                .first()
+                .map(|value| clean_keyserver_owner(value))
+                .unwrap_or_default();
+            let filename = data
+                .get(1)
+                .cloned()
+                .filter(|value| value != "-")
+                .unwrap_or_default();
+            let method = infer_keyserver_method(&cells);
+            if !entries.iter().any(|entry| entry.id == id) {
+                entries.push(KeyserverEntry {
+                    id,
+                    owner: if owner.is_empty() {
+                        nearby_keyserver_label(html, "", id)
+                    } else {
+                        owner
+                    },
+                    filename,
+                    method,
+                });
+            }
         }
-        let Ok(id) = cells[0].parse::<u64>() else {
-            continue;
-        };
+        rest = &rest[end_rel + 5..];
+        offset = end + 5;
+    }
 
-        // ID | Kennung | Dateiname | Download
-        let owner = cells[1].clone();
-        let filename = if cells[2] == "-" {
-            String::new()
-        } else {
-            cells[2].clone()
-        };
-        let filename = if filename == "-" {
-            String::new()
-        } else {
-            filename
-        };
-
-        entries.push(KeyserverEntry {
-            id,
-            owner,
-            filename,
-        });
+    // Einige Keyserver-Ansichten zeigen Download-Links statt einer einfachen
+    // Tabelle mit numerischer ID-Spalte. Die IDs lassen sich direkt aus den
+    // stabilen `/download/<id>`-Links gewinnen.
+    if entries.is_empty() {
+        let mut rest = lower.as_str();
+        while let Some(link) = rest.find("/download/") {
+            rest = &rest[link + "/download/".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(id) = digits.parse::<u64>() {
+                if !entries.iter().any(|entry| entry.id == id) {
+                    entries.push(KeyserverEntry {
+                        id,
+                        owner: nearby_keyserver_label(html, rest, id),
+                        filename: String::new(),
+                        method: None,
+                    });
+                }
+            }
+        }
     }
     entries
+}
+
+fn infer_keyserver_method(cells: &[String]) -> Option<Method> {
+    let description = cells.join(" ").to_ascii_lowercase();
+    if ["pqc", "ml-kem", "ml-dsa", ".pem", ".pqc"]
+        .iter()
+        .any(|marker| description.contains(marker))
+        || description
+            .split_whitespace()
+            .any(|word| matches!(word, "kem" | "dsa"))
+    {
+        Some(Method::Pqc)
+    } else if ["openpgp", "pgp", ".asc", ".gpg", ".pgp"]
+        .iter()
+        .any(|marker| description.contains(marker))
+    {
+        Some(Method::Pgp)
+    } else {
+        None
+    }
+}
+
+fn is_keyserver_method_cell(cell: &str) -> bool {
+    matches!(
+        cell.trim().to_ascii_lowercase().as_str(),
+        "openpgp" | "pgp" | "pqc" | "kem" | "dsa" | "ml-kem-768" | "ml-dsa-65"
+    )
+}
+
+fn clean_keyserver_owner(owner: &str) -> String {
+    let mut owner = owner.trim();
+    for prefix in ["OpenPGP", "PGP", "PQC", "ML-KEM-768", "ML-DSA-65"] {
+        if owner
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        {
+            owner = owner[prefix.len()..].trim_start_matches([' ', ':', '-', '·']);
+            break;
+        }
+    }
+    owner.trim().to_owned()
+}
+
+fn keyserver_entry_matches_method(entry: &KeyserverEntry, method: Method) -> bool {
+    match entry.method {
+        Some(entry_method) => entry_method == method,
+        // Alte Keyserver-Listen enthalten nur OpenPGP-Einträge ohne explizite
+        // Kennzeichnung. Diese bleiben im OpenPGP-Modus sichtbar.
+        None => method == Method::Pgp,
+    }
+}
+
+fn parse_keyserver_cells(row: &str) -> Vec<String> {
+    let lower = row.to_ascii_lowercase();
+    let mut cells = Vec::new();
+    let mut rest = lower.as_str();
+    let mut offset = 0;
+    while let Some(start_rel) = rest.find("<td") {
+        let start = offset + start_rel;
+        rest = &rest[start_rel + 3..];
+        offset = start + 3;
+        let Some(content_start_rel) = rest.find('>') else {
+            break;
+        };
+        let content_start = offset + content_start_rel + 1;
+        rest = &rest[content_start_rel + 1..];
+        offset = content_start;
+        let Some(end_rel) = rest.find("</td>") else {
+            break;
+        };
+        let end = offset + end_rel;
+        cells.push(html_unescape(
+            strip_html_tags(&row[content_start..end]).trim(),
+        ));
+        rest = &rest[end_rel + 5..];
+        offset = end + 5;
+    }
+    cells
+}
+
+fn extract_keyserver_download_id(html: &str) -> Option<u64> {
+    let lower = html.to_ascii_lowercase();
+    let link = lower.find("/download/")? + "/download/".len();
+    let digits: String = lower[link..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+fn nearby_keyserver_label(html: &str, _remaining: &str, id: u64) -> String {
+    let lower = html.to_ascii_lowercase();
+    let link = format!("/download/{id}");
+    let Some(link_at) = lower.find(&link) else {
+        return format!("Schlüssel {id}");
+    };
+
+    let mut block: Option<(usize, &'static str)> = None;
+    for tag in ["li", "tr", "article", "p", "div"] {
+        let marker = format!("<{tag}");
+        if let Some(start) = lower[..link_at].rfind(&marker) {
+            if block.is_none_or(|(previous, _)| start > previous) {
+                block = Some((start, tag));
+            }
+        }
+    }
+    let Some((start, tag)) = block else {
+        return format!("Schlüssel {id}");
+    };
+    let end = lower[link_at..]
+        .find(&format!("</{tag}>"))
+        .map(|offset| link_at + offset)
+        .unwrap_or(html.len());
+    let visible = html_unescape(strip_html_tags(&html[start..end]).trim());
+    let visible = visible
+        .split_whitespace()
+        .filter(|word| {
+            !word.eq_ignore_ascii_case("download")
+                && !word.eq_ignore_ascii_case("herunterladen")
+                && *word != id.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let visible = clean_keyserver_owner(&visible);
+    if visible.is_empty() {
+        format!("Schlüssel {id}")
+    } else {
+        visible
+    }
 }
 
 fn html_unescape(input: &str) -> String {
